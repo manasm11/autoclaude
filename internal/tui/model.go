@@ -44,20 +44,52 @@ var (
 	verifyLabelStyle = lipgloss.NewStyle().
 				Bold(true).
 				Foreground(lipgloss.Color("#FFA500"))
+
+	queueRowEven = lipgloss.NewStyle().
+			Background(lipgloss.Color("#2A2A2A")).
+			Padding(0, 1)
+
+	queueRowOdd = lipgloss.NewStyle().
+			Background(lipgloss.Color("#333333")).
+			Padding(0, 1)
+
+	queueRowSelected = lipgloss.NewStyle().
+				Background(lipgloss.Color("#7D56F4")).
+				Foreground(lipgloss.Color("#FFFFFF")).
+				Padding(0, 1)
+
+	statusSuccess = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#00FF00"))
+
+	statusPending = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#FFD700"))
+
+	statusFailed = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#FF4444"))
+
+	statusRunning = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#00BFFF"))
+
+	indexStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#626262"))
+
+	verifyStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#626262"))
 )
 
 // Model is the top-level BubbleTea model for autoclaude.
 type Model struct {
-	state        AppState
-	commands     []*types.Command
-	runner       *runner.Runner
-	textInput    textarea.Model
-	verifyInput  textinput.Model
-	inputMode    string // "prompt" or "verify"
-	width        int
-	height       int
-	err          error
-	scrollOffset int
+	state         AppState
+	commands      []*types.Command
+	runner        *runner.Runner
+	textInput     textarea.Model
+	verifyInput   textinput.Model
+	inputMode     string // "prompt" or "verify"
+	width         int
+	height        int
+	err           error
+	scrollOffset  int
+	selectedIndex int
 }
 
 // NewModel creates a new TUI model wired to the given runner.
@@ -182,6 +214,12 @@ func (m Model) handlePromptKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "tab":
 		m.textInput.Blur()
 		m.state = StateQueue
+		if m.selectedIndex >= len(m.commands) {
+			m.selectedIndex = len(m.commands) - 1
+		}
+		if m.selectedIndex < 0 {
+			m.selectedIndex = 0
+		}
 		return m, nil
 	}
 
@@ -239,6 +277,28 @@ func (m Model) handleQueueKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if len(m.commands) > 0 {
 			m.state = StateRunning
 			m.runner.Run()
+		}
+		return m, nil
+
+	case "j", "down":
+		if m.selectedIndex < len(m.commands)-1 {
+			m.selectedIndex++
+		}
+		return m, nil
+
+	case "k", "up":
+		if m.selectedIndex > 0 {
+			m.selectedIndex--
+		}
+		return m, nil
+
+	case "d":
+		if len(m.commands) > 0 && m.selectedIndex < len(m.commands) {
+			m.commands = append(m.commands[:m.selectedIndex], m.commands[m.selectedIndex+1:]...)
+			m.runner.RemoveCommand(m.selectedIndex)
+			if m.selectedIndex >= len(m.commands) && m.selectedIndex > 0 {
+				m.selectedIndex = len(m.commands) - 1
+			}
 		}
 		return m, nil
 	}
@@ -304,21 +364,85 @@ func (m Model) viewQueue() string {
 	if len(m.commands) == 0 {
 		b.WriteString("No commands in queue.\n\n")
 	} else {
+		// Clamp selectedIndex just in case
+		sel := m.selectedIndex
+		if sel >= len(m.commands) {
+			sel = len(m.commands) - 1
+		}
+		if sel < 0 {
+			sel = 0
+		}
+
+		rowWidth := m.width - 2
+		if rowWidth < 40 {
+			rowWidth = 40
+		}
+
 		for i, cmd := range m.commands {
-			icon := statusIcon(cmd.Status)
-			prompt := truncate(cmd.Prompt, 50)
-			b.WriteString(fmt.Sprintf("  %s %d. %s", icon, i+1, prompt))
+			icon := styledStatusIcon(cmd.Status)
+			status := styledStatus(cmd.Status)
+			prompt := truncate(cmd.Prompt, 80)
+			idx := indexStyle.Render(fmt.Sprintf("%d.", i+1))
+
+			var verify string
 			if cmd.Verify != "" {
-				b.WriteString(fmt.Sprintf("  [verify: %s]", truncate(cmd.Verify, 30)))
+				verify = verifyStyle.Render(fmt.Sprintf("[verify: %s]", truncate(cmd.Verify, 30)))
+			} else {
+				verify = verifyStyle.Render("[no verification]")
 			}
-			b.WriteString(fmt.Sprintf("  (%s)\n", cmd.Status))
+
+			content := fmt.Sprintf("%s %s  %s  %s %s", idx, prompt, verify, icon, status)
+
+			var rowStyle lipgloss.Style
+			if i == sel {
+				rowStyle = queueRowSelected.Width(rowWidth)
+			} else if i%2 == 0 {
+				rowStyle = queueRowEven.Width(rowWidth)
+			} else {
+				rowStyle = queueRowOdd.Width(rowWidth)
+			}
+
+			b.WriteString(rowStyle.Render(content))
+			b.WriteString("\n")
 		}
 		b.WriteString("\n")
 	}
 
-	b.WriteString(helpStyle.Render("tab/esc: back to input  |  ctrl+r: run all  |  ctrl+q: quit"))
+	b.WriteString(helpStyle.Render("tab: add more | ctrl+r: run all | d: delete | j/k: navigate | ctrl+q: quit"))
 
 	return b.String()
+}
+
+func styledStatusIcon(s types.CommandStatus) string {
+	icon := statusIcon(s)
+	switch s {
+	case types.StatusSuccess:
+		return statusSuccess.Render(icon)
+	case types.StatusPending:
+		return statusPending.Render(icon)
+	case types.StatusFailed:
+		return statusFailed.Render(icon)
+	case types.StatusRunning, types.StatusVerifying, types.StatusCommitting, types.StatusRetrying:
+		return statusRunning.Render(icon)
+	default:
+		return icon
+	}
+}
+
+func styledStatus(s types.CommandStatus) string {
+	text := string(s)
+	switch s {
+	case types.StatusSuccess:
+		return statusSuccess.Render(text)
+	case types.StatusPending:
+		return statusPending.Render(text)
+	case types.StatusFailed:
+		return statusFailed.Render(text)
+	case types.StatusRunning, types.StatusVerifying, types.StatusCommitting, types.StatusRetrying:
+		return statusRunning.Render(text)
+	default:
+		return text
+	}
 }
 
 func (m Model) viewRunning() string {

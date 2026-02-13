@@ -56,6 +56,14 @@ func (r *Runner) AddCommand(cmd *types.Command) {
 	r.Commands = append(r.Commands, cmd)
 }
 
+// RemoveCommand removes a command by index from the execution queue.
+func (r *Runner) RemoveCommand(index int) {
+	if index < 0 || index >= len(r.Commands) {
+		return
+	}
+	r.Commands = append(r.Commands[:index], r.Commands[index+1:]...)
+}
+
 // Run launches command execution in a background goroutine and returns immediately.
 func (r *Runner) Run() {
 	go r.executeAll()
