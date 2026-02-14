@@ -23,9 +23,36 @@ go build -o autoclaude .
 go install github.com/manasm11/autoclaude@latest
 ```
 
+## Quick Start
+
+```sh
+# 1. Generate a sample config file (recommended first step)
+autoclaude init
+
+# 2. Edit the generated autoclaude.toml with your commands
+$EDITOR autoclaude.toml
+
+# 3. Run autoclaude
+autoclaude
+```
+
 ## Usage
 
 autoclaude supports three input methods that can be mixed and matched.
+
+### Generating a config file
+
+Use the `init` subcommand to create a sample `autoclaude.toml` in the current directory:
+
+```sh
+autoclaude init
+```
+
+If `autoclaude.toml` already exists, the command will refuse to overwrite it. Use `--force` to overwrite:
+
+```sh
+autoclaude init --force
+```
 
 ### 1. Interactive TUI
 
@@ -112,6 +139,13 @@ autoclaude -c "Fix the bug::go test ./..." --auto-run
 ```
 
 `--auto-run` requires at least one command via `--file` or `--cmd`.
+
+## Subcommands
+
+| Subcommand | Description |
+|------------|-------------|
+| `autoclaude init` | Generate a sample `autoclaude.toml` in the current directory |
+| `autoclaude init --force` | Overwrite an existing `autoclaude.toml` |
 
 ## Flag reference
 

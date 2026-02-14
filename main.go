@@ -35,6 +35,11 @@ func usage() {
 
 Usage:
   autoclaude [flags]
+  autoclaude init [--force]
+
+Subcommands:
+  init          Generate a sample autoclaude.toml in the current directory
+    --force     Overwrite an existing autoclaude.toml
 
 Flags:
   -f, --file string       Path to a TOML config file
@@ -57,6 +62,29 @@ Examples:
 }
 
 func main() {
+	// Subcommand intercept: handle "autoclaude init" before flag parsing
+	if len(os.Args) >= 2 && os.Args[1] == "init" {
+		force := false
+		for _, arg := range os.Args[2:] {
+			if arg == "--force" {
+				force = true
+			}
+		}
+		cwd, err := os.Getwd()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error getting working directory: %v\n", err)
+			os.Exit(1)
+		}
+		path, err := config.GenerateSampleConfig(cwd, force)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		fmt.Printf("Created autoclaude.toml in %s\n", filepath.Dir(path))
+		fmt.Println("Edit the file to add your commands, then run: autoclaude")
+		os.Exit(0)
+	}
+
 	// Define flag variables
 	var (
 		configFile   string
