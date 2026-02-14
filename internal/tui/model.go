@@ -113,6 +113,7 @@ type Model struct {
 	done          bool
 	outputLines   []string
 	statusMsg     string
+	autoRun       bool
 }
 
 // NewModel creates a new TUI model wired to the given runner.
@@ -145,14 +146,54 @@ func NewModel(r *runner.Runner) Model {
 	}
 }
 
+// SetCommands pre-loads commands into the TUI model (e.g. from CLI flags).
+func (m *Model) SetCommands(cmds []*types.Command) {
+	m.commands = cmds
+}
+
+// SetAutoRun configures the model to skip queue review and start execution on init.
+func (m *Model) SetAutoRun() {
+	m.autoRun = true
+}
+
 // Init returns the initial command for the BubbleTea program.
 func (m Model) Init() tea.Cmd {
+	if m.autoRun && len(m.commands) > 0 {
+		return func() tea.Msg {
+			return autoRunMsg{}
+		}
+	}
+	if len(m.commands) > 0 {
+		return func() tea.Msg {
+			return showQueueMsg{}
+		}
+	}
 	return textarea.Blink
 }
+
+// autoRunMsg triggers immediate execution, skipping the TUI queue review.
+type autoRunMsg struct{}
+
+// showQueueMsg switches to queue view for reviewing pre-loaded commands.
+type showQueueMsg struct{}
 
 // Update handles all incoming messages and returns the updated model.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case autoRunMsg:
+		m.state = StateRunning
+		m.done = false
+		m.currentCmd = -1
+		m.scrollOffset = 0
+		m.outputLines = nil
+		m.runner.Run()
+		return m, m.spinner.Tick
+
+	case showQueueMsg:
+		m.state = StateQueue
+		m.textInput.Blur()
+		return m, nil
+
 	case tea.KeyMsg:
 		return m.handleKeyMsg(msg)
 
