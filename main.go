@@ -116,9 +116,18 @@ func main() {
 
 	// Build commands from file and -c flags
 	var commands []*types.Command
+	var fileCount, cliCount int
 
 	// 1. Load from TOML config file first
 	if configFile != "" {
+		absPath, pathErr := filepath.Abs(configFile)
+		if pathErr != nil {
+			absPath = configFile
+		}
+		if _, statErr := os.Stat(configFile); os.IsNotExist(statErr) {
+			fmt.Fprintf(os.Stderr, "Error: config file not found: %s\n", absPath)
+			os.Exit(1)
+		}
 		cfg, err := config.LoadConfig(configFile)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error loading config file: %v\n", err)
@@ -133,6 +142,7 @@ func main() {
 			maxRetries = cfg.MaxRetries
 		}
 		commands = append(commands, cfg.ToCommands()...)
+		fileCount = len(cfg.Commands)
 	}
 
 	// 2. Append -c flag commands after file commands
@@ -146,6 +156,20 @@ func main() {
 		cmd.Verify = verify
 		cmd.MaxRetries = maxRetries
 		commands = append(commands, cmd)
+		cliCount++
+	}
+
+	// 3. Apply global --max-retries to any command without its own override
+	for _, cmd := range commands {
+		if cmd.MaxRetries <= 0 {
+			cmd.MaxRetries = maxRetries
+		}
+	}
+
+	// 4. Validate --auto-run requires commands
+	if autoRun && len(commands) == 0 {
+		fmt.Fprintln(os.Stderr, "Error: --auto-run requires commands via --file or --cmd")
+		os.Exit(1)
 	}
 
 	r := runner.NewRunner(wd)
@@ -161,6 +185,15 @@ func main() {
 	// If commands were loaded, sync them into the TUI model
 	if len(commands) > 0 {
 		model.SetCommands(commands)
+
+		// Build startup status message showing source breakdown
+		if fileCount > 0 && cliCount > 0 {
+			model.SetStatusMsg(fmt.Sprintf("Loaded %d commands from config + %d from CLI flags", fileCount, cliCount))
+		} else if fileCount > 0 {
+			model.SetStatusMsg(fmt.Sprintf("Loaded %d commands from config", fileCount))
+		} else if cliCount > 0 {
+			model.SetStatusMsg(fmt.Sprintf("Loaded %d commands from CLI flags", cliCount))
+		}
 	}
 
 	// If auto-run is set and we have commands, start in running state

@@ -151,6 +151,11 @@ func (m *Model) SetCommands(cmds []*types.Command) {
 	m.commands = cmds
 }
 
+// SetStatusMsg sets a status message to display on startup (e.g. command load summary).
+func (m *Model) SetStatusMsg(msg string) {
+	m.statusMsg = msg
+}
+
 // SetAutoRun configures the model to skip queue review and start execution on init.
 func (m *Model) SetAutoRun() {
 	m.autoRun = true
@@ -569,6 +574,11 @@ func (m Model) viewInput() string {
 
 func (m Model) viewQueue() string {
 	var b strings.Builder
+
+	if m.statusMsg != "" {
+		b.WriteString(helpStyle.Render(m.statusMsg))
+		b.WriteString("\n\n")
+	}
 
 	if len(m.commands) == 0 {
 		b.WriteString("No commands in queue.\n\n")
