@@ -47,3 +47,60 @@ func NewCommand(prompt string) *Command {
 		Status: StatusPending,
 	}
 }
+
+// ParseCommandStatus converts a string back to a CommandStatus.
+// Returns StatusPending for unrecognized values.
+func ParseCommandStatus(s string) CommandStatus {
+	switch s {
+	case "Pending":
+		return StatusPending
+	case "Running":
+		return StatusRunning
+	case "Verifying":
+		return StatusVerifying
+	case "Committing":
+		return StatusCommitting
+	case "Success":
+		return StatusSuccess
+	case "Failed":
+		return StatusFailed
+	case "Retrying":
+		return StatusRetrying
+	default:
+		return StatusPending
+	}
+}
+
+// SessionCommand is a JSON-friendly representation of a Command for session persistence.
+type SessionCommand struct {
+	Prompt     string `json:"prompt"`
+	Verify     string `json:"verify,omitempty"`
+	MaxRetries int    `json:"max_retries"`
+	Status     string `json:"status"`
+	Attempts   int    `json:"attempts"`
+	Output     string `json:"output,omitempty"`
+}
+
+// ToSessionCommand converts a Command to a SessionCommand for serialization.
+func (c *Command) ToSessionCommand() SessionCommand {
+	return SessionCommand{
+		Prompt:     c.Prompt,
+		Verify:     c.Verify,
+		MaxRetries: c.MaxRetries,
+		Status:     c.Status.String(),
+		Attempts:   c.Attempts,
+		Output:     c.Output,
+	}
+}
+
+// FromSessionCommand creates a Command from a SessionCommand.
+func FromSessionCommand(sc SessionCommand) *Command {
+	return &Command{
+		Prompt:     sc.Prompt,
+		Verify:     sc.Verify,
+		MaxRetries: sc.MaxRetries,
+		Status:     ParseCommandStatus(sc.Status),
+		Attempts:   sc.Attempts,
+		Output:     sc.Output,
+	}
+}
