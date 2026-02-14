@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -42,6 +43,7 @@ Flags:
   -w, --work-dir string   Working directory (default: current directory)
   -a, --auto-run          Skip TUI queue review and start execution immediately
   -R, --no-resume         Skip session detection and start fresh (clears any existing session)
+      --clear-session     Delete any existing session file and exit
   -h, --help              Show this help message
 
 Examples:
@@ -49,6 +51,7 @@ Examples:
   autoclaude -c "Add error handling to the API layer" -c "Write unit tests for API::go test ./..."
   autoclaude -f base.toml -c "One more fix::go build ./..."
   autoclaude -f commands.toml --auto-run
+  autoclaude --clear-session
   autoclaude
 `)
 }
@@ -56,13 +59,14 @@ Examples:
 func main() {
 	// Define flag variables
 	var (
-		configFile string
-		cmds       stringSlice
-		maxRetries int
-		workDir    string
-		autoRun    bool
-		noResume   bool
-		showHelp   bool
+		configFile   string
+		cmds         stringSlice
+		maxRetries   int
+		workDir      string
+		autoRun      bool
+		noResume     bool
+		clearSession bool
+		showHelp     bool
 	)
 
 	// Long flags
@@ -72,6 +76,7 @@ func main() {
 	flag.StringVar(&workDir, "work-dir", "", "working directory for command execution (defaults to current directory)")
 	flag.BoolVar(&autoRun, "auto-run", false, "skip TUI queue review and start execution immediately")
 	flag.BoolVar(&noResume, "no-resume", false, "skip session detection and start fresh")
+	flag.BoolVar(&clearSession, "clear-session", false, "delete any existing session file and exit")
 	flag.BoolVar(&showHelp, "help", false, "show usage with examples")
 
 	// Short flag aliases
@@ -113,6 +118,17 @@ func main() {
 		os.Exit(1)
 	}
 
+	// --clear-session: delete session file and exit
+	if clearSession {
+		session.Clear(wd)
+		if session.Exists(wd) {
+			fmt.Fprintln(os.Stderr, "Error: failed to clear session file")
+			os.Exit(1)
+		}
+		fmt.Println("Session file cleared.")
+		os.Exit(0)
+	}
+
 	if _, err := exec.LookPath("claude"); err != nil {
 		fmt.Fprintln(os.Stderr, "Error: 'claude' CLI not found in PATH.")
 		fmt.Fprintln(os.Stderr, "Install Claude Code: https://docs.anthropic.com/en/docs/claude-code")
@@ -127,7 +143,26 @@ func main() {
 	} else if session.Exists(wd) {
 		sess, err := session.Load(wd)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to load session file: %v\n", err)
+			if errors.Is(err, session.ErrCorrupted) {
+				fmt.Fprintln(os.Stderr, "Warning: session file corrupted, starting fresh")
+			} else {
+				fmt.Fprintf(os.Stderr, "Warning: failed to load session file: %v\n", err)
+			}
+			session.Clear(wd)
+		} else if session.AllSucceeded(sess) {
+			// All commands already succeeded — nothing to resume
+			session.Clear(wd)
+		} else if sess.WorkDir != wd {
+			fmt.Fprintf(os.Stderr, "Warning: session was created in %s but current directory is %s\n", sess.WorkDir, wd)
+			fmt.Fprint(os.Stderr, "Resume anyway? [y/N] ")
+			var answer string
+			fmt.Scanln(&answer)
+			answer = strings.TrimSpace(strings.ToLower(answer))
+			if answer == "y" || answer == "yes" {
+				resumeSession = sess
+			} else {
+				session.Clear(wd)
+			}
 		} else {
 			resumeSession = sess
 		}
@@ -212,9 +247,22 @@ func main() {
 
 	model := tui.NewModel(r)
 
-	// If a previous session was detected, configure resume screen
+	// If a previous session was detected, configure resume
 	if resumeSession != nil {
-		model.SetResumeSession(resumeSession)
+		if autoRun {
+			// Auto-resume: skip TUI prompt, log to stdout, and start from where we left off
+			resumeIndex := len(resumeSession.Commands)
+			for i, sc := range resumeSession.Commands {
+				if types.ParseCommandStatus(sc.Status) != types.StatusSuccess {
+					resumeIndex = i
+					break
+				}
+			}
+			fmt.Printf("Resuming previous session from command %d/%d\n", resumeIndex+1, len(resumeSession.Commands))
+			model.SetAutoResume(resumeSession, resumeIndex)
+		} else {
+			model.SetResumeSession(resumeSession)
+		}
 	}
 
 	// If commands were loaded, sync them into the TUI model

@@ -121,6 +121,7 @@ type Model struct {
 	autoLoadFile   string // filename of auto-detected config (e.g. "autoclaude.toml")
 	resumeSession  *session.SessionState // detected previous session (nil if none)
 	resumeIndex    int                   // index where execution would resume from
+	autoResume     bool                  // auto-resume without TUI prompt (--auto-run)
 }
 
 // NewModel creates a new TUI model wired to the given runner.
@@ -187,9 +188,21 @@ func (m *Model) SetResumeSession(sess *session.SessionState) {
 	}
 }
 
+// SetAutoResume configures the model to automatically resume a session without showing the TUI prompt.
+func (m *Model) SetAutoResume(sess *session.SessionState, resumeIndex int) {
+	m.resumeSession = sess
+	m.resumeIndex = resumeIndex
+	m.autoResume = true
+}
+
 // Init returns the initial command for the BubbleTea program.
 func (m Model) Init() tea.Cmd {
 	if m.resumeSession != nil {
+		if m.autoResume {
+			return func() tea.Msg {
+				return resumeRunMsg{}
+			}
+		}
 		return func() tea.Msg {
 			return showResumeMsg{}
 		}
@@ -641,11 +654,11 @@ func (m Model) viewResume() string {
 		return b.String()
 	}
 
-	// Header with timestamp
+	// Header with relative timestamp
 	headerStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#FFA500"))
 	b.WriteString(headerStyle.Render("Previous session found"))
 	b.WriteString("  ")
-	b.WriteString(helpStyle.Render(sess.UpdatedAt.Format(time.RFC822)))
+	b.WriteString(helpStyle.Render(fmt.Sprintf("interrupted %s", relativeTime(sess.UpdatedAt))))
 	b.WriteString("\n\n")
 
 	// Summary counts
@@ -1095,6 +1108,27 @@ func statusIcon(s types.CommandStatus) string {
 		return "\u21bb" // ↻
 	default:
 		return "?"
+	}
+}
+
+// relativeTime returns a human-readable string describing how long ago t was.
+func relativeTime(t time.Time) string {
+	d := time.Since(t)
+	switch {
+	case d < time.Minute:
+		return "just now"
+	case d < 2*time.Minute:
+		return "1 minute ago"
+	case d < time.Hour:
+		return fmt.Sprintf("%d minutes ago", int(d.Minutes()))
+	case d < 2*time.Hour:
+		return "1 hour ago"
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%d hours ago", int(d.Hours()))
+	case d < 48*time.Hour:
+		return "yesterday"
+	default:
+		return fmt.Sprintf("%d days ago", int(d.Hours()/24))
 	}
 }
 

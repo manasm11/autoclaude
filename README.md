@@ -122,6 +122,8 @@ autoclaude -c "Fix the bug::go test ./..." --auto-run
 | `-r` | `--max-retries` | int | `3` | Maximum retries per command |
 | `-w` | `--work-dir` | string | current dir | Working directory for execution |
 | `-a` | `--auto-run` | bool | `false` | Skip TUI review, start immediately |
+| `-R` | `--no-resume` | bool | `false` | Skip session detection and start fresh |
+| | `--clear-session` | bool | `false` | Delete any existing session file and exit |
 | `-h` | `--help` | bool | `false` | Show help message |
 
 ## Command lifecycle
@@ -151,6 +153,50 @@ Pending → Running → Verifying → Committing → Success
 - Per-command `max_retries` in the TOML config overrides the global value.
 - The CLI `--max-retries` flag sets the global default.
 - On the **first permanent failure**, execution halts — remaining commands stay Pending.
+
+## Session resume
+
+autoclaude automatically saves execution progress to a session file so you can resume after interruptions (Ctrl+C, crash, terminal close, etc.).
+
+### How it works
+
+During execution, autoclaude writes `.autoclaude-session.json` to the working directory after every status change. This file records each command's status, output, attempts, and the current position.
+
+If execution is interrupted, the next time you run autoclaude in the same directory, a **Resume** screen appears showing:
+
+- Which commands completed, failed, or are still pending
+- A relative timestamp ("2 hours ago", "yesterday") showing when the session was interrupted
+- The exact command where execution will resume from
+
+You can then choose to:
+- **`r`** — Resume from where it left off
+- **`n`** — Discard the session and start fresh
+- **`q`** — Quit (session file is preserved for next time)
+
+### Auto-resume with `--auto-run`
+
+When `--auto-run` is used and a session file exists, autoclaude skips the TUI prompt and automatically resumes from where it left off. This is the expected behavior for CI/scripted usage. A message is logged to stdout:
+
+```
+Resuming previous session from command 3/5
+```
+
+### When the session file is cleared
+
+- **All commands succeed** — the session file is automatically deleted
+- **`--no-resume` flag** — the session file is deleted on startup
+- **`--clear-session` flag** — the session file is deleted and autoclaude exits
+- **Pressing `n`** on the Resume screen — the session file is deleted
+
+### Edge cases
+
+- **Corrupted file**: If the session file contains invalid JSON, autoclaude prints a warning ("Session file corrupted, starting fresh"), deletes it, and proceeds normally.
+- **Directory mismatch**: If the session was saved in a different working directory, autoclaude warns you and asks for confirmation before resuming.
+- **All commands already succeeded**: If a session file exists but every command has status "Success" (e.g. the cleanup step after completion failed), autoclaude silently clears it and proceeds normally.
+
+### Session file location
+
+The session file is always named `.autoclaude-session.json` and is placed in the working directory. It is included in `.gitignore` by default — you should not commit it.
 
 ## Config file auto-detection
 
@@ -220,6 +266,14 @@ autoclaude.refactor.toml # refactoring batch
 | `Tab` / `Esc` | Return to Input view |
 | `Ctrl+R` | Run all queued commands |
 | `Ctrl+Q` | Quit |
+
+### Resume view
+
+| Key | Action |
+|-----|--------|
+| `r` | Resume execution from where it left off |
+| `n` | Discard session and start fresh |
+| `q` | Quit (session preserved) |
 
 ### Running view
 

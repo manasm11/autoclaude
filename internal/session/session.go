@@ -11,6 +11,9 @@ import (
 	"github.com/manasm11/autoclaude/internal/types"
 )
 
+// ErrCorrupted indicates the session file exists but contains invalid JSON.
+var ErrCorrupted = errors.New("session file corrupted")
+
 // SessionFile is the filename used to persist session state.
 const SessionFile = ".autoclaude-session.json"
 
@@ -64,7 +67,7 @@ func Load(dir string) (*SessionState, error) {
 
 	var state SessionState
 	if err := json.Unmarshal(data, &state); err != nil {
-		return nil, fmt.Errorf("parsing session file: %w", err)
+		return nil, fmt.Errorf("%w: %v", ErrCorrupted, err)
 	}
 
 	return &state, nil
@@ -85,6 +88,19 @@ func Exists(dir string) bool {
 	path := filepath.Join(dir, SessionFile)
 	_, err := os.Stat(path)
 	return err == nil
+}
+
+// AllSucceeded returns true if every command in the session has StatusSuccess.
+func AllSucceeded(state *SessionState) bool {
+	if len(state.Commands) == 0 {
+		return false
+	}
+	for _, sc := range state.Commands {
+		if types.ParseCommandStatus(sc.Status) != types.StatusSuccess {
+			return false
+		}
+	}
+	return true
 }
 
 // ToCommands converts the SessionState's command list back to types.Command slices.
