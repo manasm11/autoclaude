@@ -3,6 +3,7 @@ package tui
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textarea"
@@ -10,6 +11,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/manasm11/autoclaude/internal/runner"
+	"github.com/manasm11/autoclaude/internal/session"
 	"github.com/manasm11/autoclaude/internal/types"
 )
 
@@ -20,6 +22,7 @@ const (
 	StateInput   AppState = iota // Adding commands
 	StateQueue                   // Viewing the queue
 	StateRunning                 // Execution in progress
+	StateResume                  // Previous session detected
 )
 
 // Styles
@@ -114,8 +117,10 @@ type Model struct {
 	outputLines   []string
 	statusMsg     string
 	autoRun       bool
-	autoLoadCount int    // number of commands auto-loaded from detected config
-	autoLoadFile  string // filename of auto-detected config (e.g. "autoclaude.toml")
+	autoLoadCount  int    // number of commands auto-loaded from detected config
+	autoLoadFile   string // filename of auto-detected config (e.g. "autoclaude.toml")
+	resumeSession  *session.SessionState // detected previous session (nil if none)
+	resumeIndex    int                   // index where execution would resume from
 }
 
 // NewModel creates a new TUI model wired to the given runner.
@@ -169,8 +174,26 @@ func (m *Model) SetAutoRun() {
 	m.autoRun = true
 }
 
+// SetResumeSession configures the model to show the resume screen on startup.
+func (m *Model) SetResumeSession(sess *session.SessionState) {
+	m.resumeSession = sess
+	// Find the first non-Success command index
+	m.resumeIndex = len(sess.Commands) // default: past end (all succeeded)
+	for i, sc := range sess.Commands {
+		if types.ParseCommandStatus(sc.Status) != types.StatusSuccess {
+			m.resumeIndex = i
+			break
+		}
+	}
+}
+
 // Init returns the initial command for the BubbleTea program.
 func (m Model) Init() tea.Cmd {
+	if m.resumeSession != nil {
+		return func() tea.Msg {
+			return showResumeMsg{}
+		}
+	}
 	if m.autoRun && len(m.commands) > 0 {
 		return func() tea.Msg {
 			return autoRunMsg{}
@@ -190,6 +213,15 @@ type autoRunMsg struct{}
 // showQueueMsg switches to queue view for reviewing pre-loaded commands.
 type showQueueMsg struct{}
 
+// showResumeMsg switches to the resume screen when a previous session is detected.
+type showResumeMsg struct{}
+
+// resumeRunMsg triggers execution from the resume point.
+type resumeRunMsg struct{}
+
+// newSessionMsg discards the old session and proceeds with normal startup.
+type newSessionMsg struct{}
+
 // Update handles all incoming messages and returns the updated model.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
@@ -205,6 +237,49 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case showQueueMsg:
 		m.state = StateQueue
 		m.textInput.Blur()
+		return m, nil
+
+	case showResumeMsg:
+		m.state = StateResume
+		m.textInput.Blur()
+		return m, nil
+
+	case resumeRunMsg:
+		// Load commands from session, prepare runner, and start execution
+		sess := m.resumeSession
+		cmds := session.ToCommands(sess)
+
+		// Reset the resume-from command to pending with fresh retry budget
+		if m.resumeIndex < len(cmds) {
+			cmds[m.resumeIndex].Status = types.StatusPending
+			cmds[m.resumeIndex].Attempts = 0
+		}
+
+		m.commands = cmds
+		m.runner.Commands = cmds
+		m.runner.MaxRetries = sess.MaxRetries
+		m.runner.CurrentIndex = m.resumeIndex
+
+		m.resumeSession = nil
+		m.state = StateRunning
+		m.done = false
+		m.currentCmd = -1
+		m.scrollOffset = 0
+		m.outputLines = nil
+		m.runner.RunFrom(m.resumeIndex)
+		return m, m.spinner.Tick
+
+	case newSessionMsg:
+		// Discard old session, proceed with normal startup
+		session.Clear(m.runner.WorkDir)
+		m.resumeSession = nil
+		if len(m.commands) > 0 {
+			m.state = StateQueue
+		} else {
+			m.state = StateInput
+			m.textInput.Focus()
+			return m, textarea.Blink
+		}
 		return m, nil
 
 	case tea.KeyMsg:
@@ -309,6 +384,9 @@ func (m Model) handleKeyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	switch m.state {
+	case StateResume:
+		return m.handleResumeKey(msg)
+
 	case StateInput:
 		if m.inputMode == "prompt" {
 			return m.handlePromptKey(msg)
@@ -320,6 +398,21 @@ func (m Model) handleKeyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case StateRunning:
 		return m.handleRunningKey(msg)
+	}
+
+	return m, nil
+}
+
+func (m Model) handleResumeKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	key := msg.String()
+
+	switch key {
+	case "r":
+		return m, func() tea.Msg { return resumeRunMsg{} }
+	case "n":
+		return m, func() tea.Msg { return newSessionMsg{} }
+	case "q":
+		return m, tea.Quit
 	}
 
 	return m, nil
@@ -511,6 +604,8 @@ func (m Model) viewName() string {
 		return "Queue"
 	case StateRunning:
 		return "Running"
+	case StateResume:
+		return "Resume"
 	default:
 		return ""
 	}
@@ -525,6 +620,8 @@ func (m Model) View() string {
 	b.WriteString("\n\n")
 
 	switch m.state {
+	case StateResume:
+		b.WriteString(m.viewResume())
 	case StateInput:
 		b.WriteString(m.viewInput())
 	case StateQueue:
@@ -532,6 +629,123 @@ func (m Model) View() string {
 	case StateRunning:
 		b.WriteString(m.viewRunning())
 	}
+
+	return b.String()
+}
+
+func (m Model) viewResume() string {
+	var b strings.Builder
+	sess := m.resumeSession
+	if sess == nil {
+		b.WriteString("No session data.\n")
+		return b.String()
+	}
+
+	// Header with timestamp
+	headerStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#FFA500"))
+	b.WriteString(headerStyle.Render("Previous session found"))
+	b.WriteString("  ")
+	b.WriteString(helpStyle.Render(sess.UpdatedAt.Format(time.RFC822)))
+	b.WriteString("\n\n")
+
+	// Summary counts
+	total := len(sess.Commands)
+	completed := 0
+	failed := 0
+	remaining := 0
+	for _, sc := range sess.Commands {
+		switch types.ParseCommandStatus(sc.Status) {
+		case types.StatusSuccess:
+			completed++
+		case types.StatusFailed:
+			failed++
+		default:
+			remaining++
+		}
+	}
+
+	summaryStyle := lipgloss.NewStyle().Bold(true)
+	b.WriteString(summaryStyle.Render(fmt.Sprintf("Total: %d", total)))
+	b.WriteString("  ")
+	b.WriteString(statusSuccess.Render(fmt.Sprintf("Completed: %d", completed)))
+	b.WriteString("  ")
+	b.WriteString(statusFailed.Render(fmt.Sprintf("Failed: %d", failed)))
+	b.WriteString("  ")
+	b.WriteString(statusPending.Render(fmt.Sprintf("Remaining: %d", remaining)))
+	b.WriteString("\n\n")
+
+	// Command list
+	rowWidth := m.width - 2
+	if rowWidth < 40 {
+		rowWidth = 40
+	}
+
+	// Windowed rendering for long lists
+	maxVisible := m.height - 12
+	if maxVisible < 3 {
+		maxVisible = 3
+	}
+
+	startIdx := 0
+	endIdx := total
+	if total > maxVisible {
+		startIdx = m.resumeIndex - maxVisible/2
+		if startIdx < 0 {
+			startIdx = 0
+		}
+		endIdx = startIdx + maxVisible
+		if endIdx > total {
+			endIdx = total
+			startIdx = endIdx - maxVisible
+			if startIdx < 0 {
+				startIdx = 0
+			}
+		}
+	}
+
+	if startIdx > 0 {
+		b.WriteString(helpStyle.Render(fmt.Sprintf("  ... %d more above ...", startIdx)))
+		b.WriteString("\n")
+	}
+
+	resumeMarker := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#FFA500"))
+
+	for i := startIdx; i < endIdx; i++ {
+		sc := sess.Commands[i]
+		status := types.ParseCommandStatus(sc.Status)
+		icon := styledStatusIcon(status)
+		label := styledStatus(status)
+		prompt := truncate(sc.Prompt, 70)
+		idx := indexStyle.Render(fmt.Sprintf("%d.", i+1))
+
+		content := fmt.Sprintf("%s %s  %s %s", idx, prompt, icon, label)
+
+		if i == m.resumeIndex {
+			content = resumeMarker.Render(">> ") + content
+		} else {
+			content = "   " + content
+		}
+
+		var rowStyle lipgloss.Style
+		if i == m.resumeIndex {
+			rowStyle = queueRowSelected.Width(rowWidth)
+		} else if i%2 == 0 {
+			rowStyle = queueRowEven.Width(rowWidth)
+		} else {
+			rowStyle = queueRowOdd.Width(rowWidth)
+		}
+
+		b.WriteString(rowStyle.Render(content))
+		b.WriteString("\n")
+	}
+
+	if endIdx < total {
+		b.WriteString(helpStyle.Render(fmt.Sprintf("  ... %d more below ...", total-endIdx)))
+		b.WriteString("\n")
+	}
+
+	b.WriteString("\n")
+	b.WriteString(helpStyle.Render("r: resume  |  n: new session  |  q: quit"))
 
 	return b.String()
 }

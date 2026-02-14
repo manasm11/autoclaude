@@ -10,6 +10,7 @@ import (
 
 	"github.com/manasm11/autoclaude/internal/config"
 	"github.com/manasm11/autoclaude/internal/runner"
+	"github.com/manasm11/autoclaude/internal/session"
 	"github.com/manasm11/autoclaude/internal/tui"
 	"github.com/manasm11/autoclaude/internal/types"
 
@@ -40,6 +41,7 @@ Flags:
   -r, --max-retries int   Maximum retries per command (default 3)
   -w, --work-dir string   Working directory (default: current directory)
   -a, --auto-run          Skip TUI queue review and start execution immediately
+  -R, --no-resume         Skip session detection and start fresh (clears any existing session)
   -h, --help              Show this help message
 
 Examples:
@@ -59,6 +61,7 @@ func main() {
 		maxRetries int
 		workDir    string
 		autoRun    bool
+		noResume   bool
 		showHelp   bool
 	)
 
@@ -68,6 +71,7 @@ func main() {
 	flag.IntVar(&maxRetries, "max-retries", 3, "maximum number of retries per command")
 	flag.StringVar(&workDir, "work-dir", "", "working directory for command execution (defaults to current directory)")
 	flag.BoolVar(&autoRun, "auto-run", false, "skip TUI queue review and start execution immediately")
+	flag.BoolVar(&noResume, "no-resume", false, "skip session detection and start fresh")
 	flag.BoolVar(&showHelp, "help", false, "show usage with examples")
 
 	// Short flag aliases
@@ -76,6 +80,7 @@ func main() {
 	flag.IntVar(&maxRetries, "r", 3, "maximum retries per command (shorthand)")
 	flag.StringVar(&workDir, "w", "", "working directory (shorthand)")
 	flag.BoolVar(&autoRun, "a", false, "skip TUI queue review (shorthand)")
+	flag.BoolVar(&noResume, "R", false, "skip session detection (shorthand)")
 	flag.BoolVar(&showHelp, "h", false, "show help (shorthand)")
 
 	flag.Usage = usage
@@ -112,6 +117,20 @@ func main() {
 		fmt.Fprintln(os.Stderr, "Error: 'claude' CLI not found in PATH.")
 		fmt.Fprintln(os.Stderr, "Install Claude Code: https://docs.anthropic.com/en/docs/claude-code")
 		os.Exit(1)
+	}
+
+	// Session resume detection (before loading TOML/CLI commands)
+	var resumeSession *session.SessionState
+	if noResume {
+		// --no-resume: clear any existing session and skip detection
+		session.Clear(wd)
+	} else if session.Exists(wd) {
+		sess, err := session.Load(wd)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to load session file: %v\n", err)
+		} else {
+			resumeSession = sess
+		}
 	}
 
 	// Build commands from file and -c flags
@@ -192,6 +211,11 @@ func main() {
 	}
 
 	model := tui.NewModel(r)
+
+	// If a previous session was detected, configure resume screen
+	if resumeSession != nil {
+		model.SetResumeSession(resumeSession)
+	}
 
 	// If commands were loaded, sync them into the TUI model
 	if len(commands) > 0 {

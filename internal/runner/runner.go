@@ -91,6 +91,11 @@ func (r *Runner) Run() {
 	go r.executeAll()
 }
 
+// RunFrom launches command execution starting from the given index, skipping earlier commands.
+func (r *Runner) RunFrom(startIndex int) {
+	go r.executeFrom(startIndex)
+}
+
 func (r *Runner) executeAll() {
 	for i, cmd := range r.Commands {
 		r.CurrentIndex = i
@@ -177,6 +182,91 @@ func (r *Runner) executeAll() {
 	}
 
 	// All commands completed successfully — clear session file since no resume is needed
+	session.Clear(r.WorkDir)
+	r.sendAllDone()
+}
+
+func (r *Runner) executeFrom(startIndex int) {
+	for i := startIndex; i < len(r.Commands); i++ {
+		cmd := r.Commands[i]
+		r.CurrentIndex = i
+
+		cmd.Status = types.StatusRunning
+		r.sendUpdate(i, types.StatusRunning, "")
+		r.saveSession()
+
+		success := false
+		for cmd.Attempts < cmd.MaxRetries {
+			cmd.Attempts++
+
+			output, err := r.runClaude(i, cmd.Prompt)
+			cmd.Output = output
+
+			if err != nil {
+				if cmd.Attempts < cmd.MaxRetries {
+					cmd.Status = types.StatusRetrying
+					r.sendUpdate(i, types.StatusRetrying, output)
+					r.saveSession()
+					continue
+				}
+				cmd.Status = types.StatusFailed
+				r.sendUpdate(i, types.StatusFailed, output)
+				r.saveSession()
+				r.sendAllDone()
+				return
+			}
+
+			if cmd.Verify != "" {
+				cmd.Status = types.StatusVerifying
+				r.sendUpdate(i, types.StatusVerifying, cmd.Output)
+				r.saveSession()
+
+				verifyOutput, verifyErr := r.runVerify(i, cmd.Verify)
+				cmd.Output = cmd.Output + "\n" + verifyOutput
+
+				if verifyErr != nil {
+					if cmd.Attempts < cmd.MaxRetries {
+						cmd.Status = types.StatusRetrying
+						r.sendUpdate(i, types.StatusRetrying, cmd.Output)
+						r.saveSession()
+						continue
+					}
+					cmd.Status = types.StatusFailed
+					r.sendUpdate(i, types.StatusFailed, cmd.Output)
+					r.saveSession()
+					r.sendAllDone()
+					return
+				}
+			}
+
+			success = true
+			break
+		}
+
+		if !success {
+			cmd.Status = types.StatusFailed
+			r.sendUpdate(i, types.StatusFailed, cmd.Output)
+			r.saveSession()
+			r.sendAllDone()
+			return
+		}
+
+		cmd.Status = types.StatusCommitting
+		r.sendUpdate(i, types.StatusCommitting, cmd.Output)
+		r.saveSession()
+
+		commitOutput, commitErr := r.runClaude(i, "Git add all changes, commit with a concise meaningful commit message describing what was done, and push to origin. Do not ask for confirmation.")
+		if commitErr != nil {
+			cmd.Output = cmd.Output + "\n" + fmt.Sprintf("[warn] git commit/push failed: %v", commitErr)
+		} else {
+			cmd.Output = cmd.Output + "\n" + commitOutput
+		}
+
+		cmd.Status = types.StatusSuccess
+		r.sendUpdate(i, types.StatusSuccess, cmd.Output)
+		r.saveSession()
+	}
+
 	session.Clear(r.WorkDir)
 	r.sendAllDone()
 }
