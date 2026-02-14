@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -75,6 +76,9 @@ var (
 
 	verifyStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#626262"))
+
+	outputStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#A0A0A0"))
 )
 
 // Model is the top-level BubbleTea model for autoclaude.
@@ -90,6 +94,10 @@ type Model struct {
 	err           error
 	scrollOffset  int
 	selectedIndex int
+	spinner       spinner.Model
+	currentCmd    int
+	done          bool
+	outputLines   []string
 }
 
 // NewModel creates a new TUI model wired to the given runner.
@@ -106,13 +114,19 @@ func NewModel(r *runner.Runner) Model {
 	ti.Width = 80
 	ti.Blur()
 
+	s := spinner.New()
+	s.Spinner = spinner.MiniDot
+	s.Style = statusRunning
+
 	return Model{
-		state:     StateInput,
-		commands:  make([]*types.Command, 0),
-		runner:    r,
-		textInput: ta,
+		state:       StateInput,
+		commands:    make([]*types.Command, 0),
+		runner:      r,
+		textInput:   ta,
 		verifyInput: ti,
-		inputMode: "prompt",
+		inputMode:   "prompt",
+		spinner:     s,
+		currentCmd:  -1,
 	}
 }
 
@@ -136,14 +150,38 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.verifyInput.Width = w
 		return m, nil
 
+	case spinner.TickMsg:
+		if m.state == StateRunning && !m.done {
+			var cmd tea.Cmd
+			m.spinner, cmd = m.spinner.Update(msg)
+			return m, cmd
+		}
+		return m, nil
+
 	case runner.StatusUpdateMsg:
 		if msg.CmdIndex >= 0 && msg.CmdIndex < len(m.commands) {
 			m.commands[msg.CmdIndex].Status = msg.Status
 			m.commands[msg.CmdIndex].Output = msg.Output
+
+			if (msg.Status == types.StatusRunning || msg.Status == types.StatusVerifying ||
+				msg.Status == types.StatusCommitting || msg.Status == types.StatusRetrying) &&
+				msg.CmdIndex != m.currentCmd {
+				m.currentCmd = msg.CmdIndex
+				m.scrollOffset = 0
+			}
+
+			if msg.CmdIndex == m.currentCmd {
+				m.outputLines = strings.Split(msg.Output, "\n")
+				maxOff := m.maxScrollOffset()
+				if m.scrollOffset >= maxOff-3 || m.scrollOffset == 0 {
+					m.scrollOffset = maxOff
+				}
+			}
 		}
 		return m, nil
 
 	case runner.AllDoneMsg:
+		m.done = true
 		return m, nil
 
 	case runner.ExecutionErrorMsg:
@@ -182,8 +220,7 @@ func (m Model) handleKeyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleQueueKey(msg)
 
 	case StateRunning:
-		// Only ctrl+q works, handled above
-		return m, nil
+		return m.handleRunningKey(msg)
 	}
 
 	return m, nil
@@ -207,7 +244,12 @@ func (m Model) handlePromptKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if len(m.commands) > 0 {
 			m.state = StateRunning
 			m.textInput.Blur()
+			m.done = false
+			m.currentCmd = -1
+			m.scrollOffset = 0
+			m.outputLines = nil
 			m.runner.Run()
+			return m, m.spinner.Tick
 		}
 		return m, nil
 
@@ -276,7 +318,12 @@ func (m Model) handleQueueKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "ctrl+r":
 		if len(m.commands) > 0 {
 			m.state = StateRunning
+			m.done = false
+			m.currentCmd = -1
+			m.scrollOffset = 0
+			m.outputLines = nil
 			m.runner.Run()
+			return m, m.spinner.Tick
 		}
 		return m, nil
 
@@ -304,6 +351,57 @@ func (m Model) handleQueueKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	return m, nil
+}
+
+func (m Model) handleRunningKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	key := msg.String()
+
+	switch key {
+	case "q":
+		if m.done {
+			return m, tea.Quit
+		}
+		return m, nil
+	case "ctrl+c":
+		return m, tea.Quit
+	case "up", "k":
+		if m.scrollOffset > 0 {
+			m.scrollOffset--
+		}
+		return m, nil
+	case "down", "j":
+		max := m.maxScrollOffset()
+		if m.scrollOffset < max {
+			m.scrollOffset++
+		}
+		return m, nil
+	}
+
+	return m, nil
+}
+
+func (m Model) outputViewportHeight() int {
+	reserved := 10 + len(m.commands) - 1
+	if reserved < 10 {
+		reserved = 10
+	}
+	h := m.height - reserved
+	if h > 20 {
+		h = 20
+	}
+	if h < 3 {
+		h = 3
+	}
+	return h
+}
+
+func (m Model) maxScrollOffset() int {
+	vpHeight := m.outputViewportHeight()
+	max := len(m.outputLines) - vpHeight
+	if max < 0 {
+		return 0
+	}
+	return max
 }
 
 func (m Model) View() string {
@@ -430,7 +528,7 @@ func styledStatusIcon(s types.CommandStatus) string {
 }
 
 func styledStatus(s types.CommandStatus) string {
-	text := string(s)
+	text := s.String()
 	switch s {
 	case types.StatusSuccess:
 		return statusSuccess.Render(text)
@@ -446,20 +544,154 @@ func styledStatus(s types.CommandStatus) string {
 }
 
 func (m Model) viewRunning() string {
+	if m.done {
+		return m.viewRunningDone()
+	}
+	return m.viewRunningLive()
+}
+
+func (m Model) viewRunningLive() string {
 	var b strings.Builder
 
-	for i, cmd := range m.commands {
-		icon := statusIcon(cmd.Status)
-		prompt := truncate(cmd.Prompt, 50)
-		b.WriteString(fmt.Sprintf("  %s %d. %s  (%s)\n", icon, i+1, prompt, cmd.Status))
+	// Progress
+	total := len(m.commands)
+	current := m.currentCmd + 1
+	progress := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#00BFFF")).
+		Render(fmt.Sprintf("Running command %d/%d", current, total))
+	b.WriteString(progress)
+	b.WriteString("\n\n")
+
+	// Current command prompt and status
+	if m.currentCmd >= 0 && m.currentCmd < len(m.commands) {
+		cmd := m.commands[m.currentCmd]
+		b.WriteString(promptLabelStyle.Render("Prompt: "))
+		b.WriteString(truncate(cmd.Prompt, 200))
+		b.WriteString("\n")
+		b.WriteString(m.spinner.View())
+		b.WriteString(" ")
+		b.WriteString(styledStatus(cmd.Status))
+		b.WriteString("\n\n")
 	}
 
+	// Output viewport
+	b.WriteString(m.renderOutputViewport())
+	b.WriteString("\n")
+
+	// Previous commands summary
+	for i, cmd := range m.commands {
+		if i >= m.currentCmd {
+			break
+		}
+		icon := styledStatusIcon(cmd.Status)
+		prompt := truncate(cmd.Prompt, 60)
+		b.WriteString(fmt.Sprintf("  %s %d. %s\n", icon, i+1, prompt))
+	}
+	if m.currentCmd > 0 {
+		b.WriteString("\n")
+	}
+
+	// Help bar
+	b.WriteString(helpStyle.Render("up/down: scroll output  |  ctrl+c: force quit"))
+
+	return b.String()
+}
+
+func (m Model) viewRunningDone() string {
+	var b strings.Builder
+
+	// Count pass/fail
+	passed := 0
+	failed := 0
+	for _, cmd := range m.commands {
+		if cmd.Status == types.StatusSuccess {
+			passed++
+		} else if cmd.Status == types.StatusFailed {
+			failed++
+		}
+	}
+
+	// Header
+	if failed == 0 {
+		header := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#00FF00"))
+		b.WriteString(header.Render("All commands completed successfully!"))
+	} else {
+		header := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#FF4444"))
+		b.WriteString(header.Render("Execution finished with errors"))
+	}
+	b.WriteString("\n\n")
+
+	// Counts
+	b.WriteString(fmt.Sprintf("%s %d passed    %s %d failed    Total: %d\n\n",
+		statusSuccess.Render("✓"), passed,
+		statusFailed.Render("✗"), failed,
+		len(m.commands)))
+
+	// Per-command results
+	for i, cmd := range m.commands {
+		icon := styledStatusIcon(cmd.Status)
+		prompt := truncate(cmd.Prompt, 60)
+		status := styledStatus(cmd.Status)
+		b.WriteString(fmt.Sprintf("  %s %d. %s  %s\n", icon, i+1, prompt, status))
+	}
+
+	// Error
 	if m.err != nil {
-		b.WriteString(fmt.Sprintf("\nError: %v\n", m.err))
+		b.WriteString(fmt.Sprintf("\n%s\n", statusFailed.Render(fmt.Sprintf("Error: %v", m.err))))
 	}
 
 	b.WriteString("\n")
-	b.WriteString(helpStyle.Render("ctrl+q: quit"))
+	b.WriteString(helpStyle.Render("q: quit"))
+
+	return b.String()
+}
+
+func (m Model) renderOutputViewport() string {
+	var b strings.Builder
+
+	if len(m.outputLines) == 0 || (len(m.outputLines) == 1 && m.outputLines[0] == "") {
+		b.WriteString(outputStyle.Render("  (waiting for output...)"))
+		b.WriteString("\n")
+		return b.String()
+	}
+
+	vpHeight := m.outputViewportHeight()
+	offset := m.scrollOffset
+	if offset > m.maxScrollOffset() {
+		offset = m.maxScrollOffset()
+	}
+
+	// Top indicator
+	if offset > 0 {
+		b.WriteString(helpStyle.Render(fmt.Sprintf("  --- %d lines above ---", offset)))
+		b.WriteString("\n")
+	}
+
+	// Visible lines
+	end := offset + vpHeight
+	if end > len(m.outputLines) {
+		end = len(m.outputLines)
+	}
+
+	maxWidth := m.width - 4
+	if maxWidth < 40 {
+		maxWidth = 40
+	}
+
+	for i := offset; i < end; i++ {
+		line := m.outputLines[i]
+		if len(line) > maxWidth {
+			line = line[:maxWidth]
+		}
+		b.WriteString(outputStyle.Render("  " + line))
+		b.WriteString("\n")
+	}
+
+	// Bottom indicator
+	remaining := len(m.outputLines) - end
+	if remaining > 0 {
+		b.WriteString(helpStyle.Render(fmt.Sprintf("  --- %d lines below ---", remaining)))
+		b.WriteString("\n")
+	}
 
 	return b.String()
 }
