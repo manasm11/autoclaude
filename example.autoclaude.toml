@@ -1,0 +1,48 @@
+# example.autoclaude.toml — Sample configuration for autoclaude
+#
+# Copy this file to autoclaude.toml (or any name you like) and edit
+# to suit your project.  Load it with:
+#
+#   autoclaude -f autoclaude.toml
+#
+# See README.md for the full reference.
+
+# ---------------------------------------------------------------------------
+# Global settings
+# ---------------------------------------------------------------------------
+
+# Maximum retry attempts per command (default: 3).
+# Individual commands can override this with their own max_retries.
+max_retries = 5
+
+# Working directory for all commands (default: current directory).
+# Absolute or relative paths are accepted.
+work_dir = "/home/user/myproject"
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+# Each [[command]] block defines one Claude Code prompt to execute.
+# Commands run sequentially in the order they appear here.
+
+# A simple command with no verification step.
+[[command]]
+prompt = "Add comprehensive error handling to the API layer"
+
+# A command with a shell verification step.
+# After Claude finishes, the verify command runs.  If it exits non-zero the
+# command is retried (up to the global max_retries).
+[[command]]
+prompt = "Write unit tests for the user authentication module"
+verify = "go test ./internal/auth/..."
+
+# A command with its own retry limit that overrides the global value.
+[[command]]
+prompt = "Refactor the database connection pool for better concurrency"
+verify = "go test -race ./internal/db/..."
+max_retries = 10
+
+# Another command without verification — useful for documentation, formatting,
+# or other tasks where a shell check isn't needed.
+[[command]]
+prompt = "Add godoc comments to all exported functions in the handlers package"
