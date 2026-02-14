@@ -59,17 +59,26 @@ var (
 				Foreground(lipgloss.Color("#FFFFFF")).
 				Padding(0, 1)
 
+	statusPending = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#808080"))
+
+	statusRunning = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#5B9BF5"))
+
+	statusVerifying = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#00CED1"))
+
+	statusCommitting = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#DA70D6"))
+
 	statusSuccess = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#00FF00"))
-
-	statusPending = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#FFD700"))
 
 	statusFailed = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#FF4444"))
 
-	statusRunning = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#00BFFF"))
+	statusRetrying = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#FFD700"))
 
 	indexStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#626262"))
@@ -79,6 +88,11 @@ var (
 
 	outputStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#A0A0A0"))
+
+	viewNameStyle = lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color("#A0A0A0")).
+			MarginLeft(1)
 )
 
 // Model is the top-level BubbleTea model for autoclaude.
@@ -148,6 +162,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.textInput.SetWidth(w)
 		m.verifyInput.Width = w
+		taHeight := m.height * 3 / 10
+		if taHeight < 3 {
+			taHeight = 3
+		}
+		if taHeight > 12 {
+			taHeight = 12
+		}
+		m.textInput.SetHeight(taHeight)
 		return m, nil
 
 	case spinner.TickMsg:
@@ -169,6 +191,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.currentCmd = msg.CmdIndex
 				m.scrollOffset = 0
 			}
+
+			// Update spinner color to match current status
+			m.spinner.Style = statusStyleFor(msg.Status)
 
 			if msg.CmdIndex == m.currentCmd {
 				m.outputLines = strings.Split(msg.Output, "\n")
@@ -206,6 +231,9 @@ func (m Model) handleKeyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	// Global quit
 	if key == "ctrl+q" {
+		if m.state == StateRunning && !m.done {
+			m.runner.Cancel()
+		}
 		return m, tea.Quit
 	}
 
@@ -363,6 +391,7 @@ func (m Model) handleRunningKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case "ctrl+c":
+		m.runner.Cancel()
 		return m, tea.Quit
 	case "up", "k":
 		if m.scrollOffset > 0 {
@@ -386,9 +415,6 @@ func (m Model) outputViewportHeight() int {
 		reserved = 10
 	}
 	h := m.height - reserved
-	if h > 20 {
-		h = 20
-	}
 	if h < 3 {
 		h = 3
 	}
@@ -404,10 +430,24 @@ func (m Model) maxScrollOffset() int {
 	return max
 }
 
+func (m Model) viewName() string {
+	switch m.state {
+	case StateInput:
+		return "Input"
+	case StateQueue:
+		return "Queue"
+	case StateRunning:
+		return "Running"
+	default:
+		return ""
+	}
+}
+
 func (m Model) View() string {
 	var b strings.Builder
 
 	b.WriteString(titleStyle.Render("autoclaude"))
+	b.WriteString(viewNameStyle.Render(m.viewName()))
 	b.WriteString("\n\n")
 
 	switch m.state {
@@ -432,8 +472,13 @@ func (m Model) viewInput() string {
 		b.WriteString("\n\n")
 
 		queueCount := len(m.commands)
-		if queueCount > 0 {
-			b.WriteString(fmt.Sprintf("Queue: %d command(s) ready\n\n", queueCount))
+		switch queueCount {
+		case 0:
+			b.WriteString("No commands queued\n\n")
+		case 1:
+			b.WriteString("1 command queued\n\n")
+		default:
+			b.WriteString(fmt.Sprintf("%d commands queued\n\n", queueCount))
 		}
 
 		b.WriteString(helpStyle.Render("ctrl+s: submit prompt  |  tab: view queue  |  ctrl+r: run all  |  ctrl+q: quit"))
@@ -476,7 +521,37 @@ func (m Model) viewQueue() string {
 			rowWidth = 40
 		}
 
-		for i, cmd := range m.commands {
+		// Windowed rendering for long queues
+		maxVisible := m.height - 6
+		if maxVisible < 3 {
+			maxVisible = 3
+		}
+
+		startIdx := 0
+		endIdx := len(m.commands)
+		if len(m.commands) > maxVisible {
+			// Center selected item in visible window
+			startIdx = sel - maxVisible/2
+			if startIdx < 0 {
+				startIdx = 0
+			}
+			endIdx = startIdx + maxVisible
+			if endIdx > len(m.commands) {
+				endIdx = len(m.commands)
+				startIdx = endIdx - maxVisible
+				if startIdx < 0 {
+					startIdx = 0
+				}
+			}
+		}
+
+		if startIdx > 0 {
+			b.WriteString(helpStyle.Render(fmt.Sprintf("  ... %d more above ...", startIdx)))
+			b.WriteString("\n")
+		}
+
+		for i := startIdx; i < endIdx; i++ {
+			cmd := m.commands[i]
 			icon := styledStatusIcon(cmd.Status)
 			status := styledStatus(cmd.Status)
 			prompt := truncate(cmd.Prompt, 80)
@@ -503,6 +578,11 @@ func (m Model) viewQueue() string {
 			b.WriteString(rowStyle.Render(content))
 			b.WriteString("\n")
 		}
+
+		if endIdx < len(m.commands) {
+			b.WriteString(helpStyle.Render(fmt.Sprintf("  ... %d more below ...", len(m.commands)-endIdx)))
+			b.WriteString("\n")
+		}
 		b.WriteString("\n")
 	}
 
@@ -511,36 +591,33 @@ func (m Model) viewQueue() string {
 	return b.String()
 }
 
-func styledStatusIcon(s types.CommandStatus) string {
-	icon := statusIcon(s)
+func statusStyleFor(s types.CommandStatus) lipgloss.Style {
 	switch s {
-	case types.StatusSuccess:
-		return statusSuccess.Render(icon)
 	case types.StatusPending:
-		return statusPending.Render(icon)
+		return statusPending
+	case types.StatusRunning:
+		return statusRunning
+	case types.StatusVerifying:
+		return statusVerifying
+	case types.StatusCommitting:
+		return statusCommitting
+	case types.StatusSuccess:
+		return statusSuccess
 	case types.StatusFailed:
-		return statusFailed.Render(icon)
-	case types.StatusRunning, types.StatusVerifying, types.StatusCommitting, types.StatusRetrying:
-		return statusRunning.Render(icon)
+		return statusFailed
+	case types.StatusRetrying:
+		return statusRetrying
 	default:
-		return icon
+		return lipgloss.NewStyle()
 	}
 }
 
+func styledStatusIcon(s types.CommandStatus) string {
+	return statusStyleFor(s).Render(statusIcon(s))
+}
+
 func styledStatus(s types.CommandStatus) string {
-	text := s.String()
-	switch s {
-	case types.StatusSuccess:
-		return statusSuccess.Render(text)
-	case types.StatusPending:
-		return statusPending.Render(text)
-	case types.StatusFailed:
-		return statusFailed.Render(text)
-	case types.StatusRunning, types.StatusVerifying, types.StatusCommitting, types.StatusRetrying:
-		return statusRunning.Render(text)
-	default:
-		return text
-	}
+	return statusStyleFor(s).Render(s.String())
 }
 
 func (m Model) viewRunning() string {

@@ -30,6 +30,7 @@ type Runner struct {
 	Commands     []*types.Command
 	CurrentIndex int
 	WorkDir      string
+	MaxRetries   int
 	program      *tea.Program
 	ctx          context.Context
 	cancel       context.CancelFunc
@@ -39,10 +40,11 @@ type Runner struct {
 func NewRunner(workDir string) *Runner {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Runner{
-		Commands: make([]*types.Command, 0),
-		WorkDir:  workDir,
-		ctx:      ctx,
-		cancel:   cancel,
+		Commands:   make([]*types.Command, 0),
+		WorkDir:    workDir,
+		MaxRetries: 3,
+		ctx:        ctx,
+		cancel:     cancel,
 	}
 }
 
@@ -53,7 +55,15 @@ func (r *Runner) SetProgram(p *tea.Program) {
 
 // AddCommand appends a command to the execution queue.
 func (r *Runner) AddCommand(cmd *types.Command) {
+	if cmd.MaxRetries <= 0 {
+		cmd.MaxRetries = r.MaxRetries
+	}
 	r.Commands = append(r.Commands, cmd)
+}
+
+// Cancel cancels the runner's context, stopping any in-progress command execution.
+func (r *Runner) Cancel() {
+	r.cancel()
 }
 
 // RemoveCommand removes a command by index from the execution queue.

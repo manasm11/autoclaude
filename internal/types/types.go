@@ -42,8 +42,7 @@ type Command struct {
 // NewCommand creates a new Command with sensible defaults.
 func NewCommand(prompt string) *Command {
 	return &Command{
-		Prompt:     prompt,
-		MaxRetries: 3,
-		Status:     StatusPending,
+		Prompt: prompt,
+		Status: StatusPending,
 	}
 }
