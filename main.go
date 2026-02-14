@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 
 	"github.com/manasm11/autoclaude/internal/runner"
 	"github.com/manasm11/autoclaude/internal/tui"
@@ -14,12 +15,23 @@ import (
 
 func main() {
 	maxRetries := flag.Int("max-retries", 3, "maximum number of retries per command")
+	workDir := flag.String("work-dir", "", "working directory for command execution (defaults to current directory)")
 	flag.Parse()
 
-	wd, err := os.Getwd()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error getting working directory: %v\n", err)
-		os.Exit(1)
+	var wd string
+	var err error
+	if *workDir != "" {
+		wd, err = filepath.Abs(*workDir)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error resolving working directory: %v\n", err)
+			os.Exit(1)
+		}
+	} else {
+		wd, err = os.Getwd()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error getting working directory: %v\n", err)
+			os.Exit(1)
+		}
 	}
 
 	if _, err := os.Stat(wd); err != nil {

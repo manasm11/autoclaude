@@ -1,9 +1,13 @@
 package runner
 
 import (
+	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"os/exec"
+	"strings"
+	"sync"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/manasm11/autoclaude/internal/types"
@@ -23,6 +27,12 @@ type AllDoneMsg struct{}
 type ExecutionErrorMsg struct {
 	CmdIndex int
 	Err      error
+}
+
+// OutputLineMsg is sent to the TUI for each line of output from a running command.
+type OutputLineMsg struct {
+	CmdIndex int
+	Line     string
 }
 
 // Runner manages sequential execution of commands.
@@ -91,7 +101,7 @@ func (r *Runner) executeAll() {
 			cmd.Attempts++
 
 			// Run the claude command
-			output, err := r.runClaude(cmd.Prompt)
+			output, err := r.runClaude(i, cmd.Prompt)
 			cmd.Output = output
 
 			if err != nil {
@@ -103,7 +113,7 @@ func (r *Runner) executeAll() {
 				// Retries exhausted
 				cmd.Status = types.StatusFailed
 				r.sendUpdate(i, types.StatusFailed, output)
-				r.program.Send(AllDoneMsg{})
+				r.sendAllDone()
 				return
 			}
 
@@ -112,7 +122,7 @@ func (r *Runner) executeAll() {
 				cmd.Status = types.StatusVerifying
 				r.sendUpdate(i, types.StatusVerifying, cmd.Output)
 
-				verifyOutput, verifyErr := r.runVerify(cmd.Verify)
+				verifyOutput, verifyErr := r.runVerify(i, cmd.Verify)
 				cmd.Output = cmd.Output + "\n" + verifyOutput
 
 				if verifyErr != nil {
@@ -123,7 +133,7 @@ func (r *Runner) executeAll() {
 					}
 					cmd.Status = types.StatusFailed
 					r.sendUpdate(i, types.StatusFailed, cmd.Output)
-					r.program.Send(AllDoneMsg{})
+					r.sendAllDone()
 					return
 				}
 			}
@@ -136,7 +146,7 @@ func (r *Runner) executeAll() {
 		if !success {
 			cmd.Status = types.StatusFailed
 			r.sendUpdate(i, types.StatusFailed, cmd.Output)
-			r.program.Send(AllDoneMsg{})
+			r.sendAllDone()
 			return
 		}
 
@@ -144,7 +154,7 @@ func (r *Runner) executeAll() {
 		cmd.Status = types.StatusCommitting
 		r.sendUpdate(i, types.StatusCommitting, cmd.Output)
 
-		commitOutput, commitErr := r.runClaude("Git add all changes, commit with a concise meaningful commit message describing what was done, and push to origin. Do not ask for confirmation.")
+		commitOutput, commitErr := r.runClaude(i, "Git add all changes, commit with a concise meaningful commit message describing what was done, and push to origin. Do not ask for confirmation.")
 		if commitErr != nil {
 			cmd.Output = cmd.Output + "\n" + fmt.Sprintf("[warn] git commit/push failed: %v", commitErr)
 		} else {
@@ -155,7 +165,7 @@ func (r *Runner) executeAll() {
 		r.sendUpdate(i, types.StatusSuccess, cmd.Output)
 	}
 
-	r.program.Send(AllDoneMsg{})
+	r.sendAllDone()
 }
 
 func (r *Runner) sendUpdate(index int, status types.CommandStatus, output string) {
@@ -168,17 +178,69 @@ func (r *Runner) sendUpdate(index int, status types.CommandStatus, output string
 	}
 }
 
-func (r *Runner) runCommand(name string, args ...string) (string, error) {
+func (r *Runner) sendAllDone() {
+	if r.program != nil {
+		r.program.Send(AllDoneMsg{})
+	}
+}
+
+func (r *Runner) runCommandStreaming(cmdIndex int, name string, args ...string) (string, error) {
 	cmd := exec.CommandContext(r.ctx, name, args...)
 	cmd.Dir = r.WorkDir
-	out, err := cmd.CombinedOutput()
-	return string(out), err
+
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		return "", fmt.Errorf("stdout pipe: %w", err)
+	}
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		return "", fmt.Errorf("stderr pipe: %w", err)
+	}
+
+	if err := cmd.Start(); err != nil {
+		return "", fmt.Errorf("start: %w", err)
+	}
+
+	var mu sync.Mutex
+	var lines []string
+	var wg sync.WaitGroup
+
+	readPipe := func(pipe io.Reader) {
+		defer wg.Done()
+		scanner := bufio.NewScanner(pipe)
+		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+		for scanner.Scan() {
+			line := scanner.Text()
+			mu.Lock()
+			lines = append(lines, line)
+			mu.Unlock()
+			if r.program != nil {
+				r.program.Send(OutputLineMsg{
+					CmdIndex: cmdIndex,
+					Line:     line,
+				})
+			}
+		}
+	}
+
+	wg.Add(2)
+	go readPipe(stdoutPipe)
+	go readPipe(stderrPipe)
+	wg.Wait()
+
+	err = cmd.Wait()
+
+	mu.Lock()
+	output := strings.Join(lines, "\n")
+	mu.Unlock()
+
+	return output, err
 }
 
-func (r *Runner) runClaude(prompt string) (string, error) {
-	return r.runCommand("claude", "--dangerously-skip-permissions", "-p", prompt)
+func (r *Runner) runClaude(cmdIndex int, prompt string) (string, error) {
+	return r.runCommandStreaming(cmdIndex, "claude", "--dangerously-skip-permissions", "-p", prompt)
 }
 
-func (r *Runner) runVerify(verifyCmd string) (string, error) {
-	return r.runCommand("sh", "-c", verifyCmd)
+func (r *Runner) runVerify(cmdIndex int, verifyCmd string) (string, error) {
+	return r.runCommandStreaming(cmdIndex, "sh", "-c", verifyCmd)
 }

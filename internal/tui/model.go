@@ -112,6 +112,7 @@ type Model struct {
 	currentCmd    int
 	done          bool
 	outputLines   []string
+	statusMsg     string
 }
 
 // NewModel creates a new TUI model wired to the given runner.
@@ -144,10 +145,12 @@ func NewModel(r *runner.Runner) Model {
 	}
 }
 
+// Init returns the initial command for the BubbleTea program.
 func (m Model) Init() tea.Cmd {
 	return textarea.Blink
 }
 
+// Update handles all incoming messages and returns the updated model.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
@@ -180,6 +183,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case runner.OutputLineMsg:
+		if msg.CmdIndex == m.currentCmd {
+			m.outputLines = append(m.outputLines, msg.Line)
+			maxOff := m.maxScrollOffset()
+			if m.scrollOffset >= maxOff-5 || m.scrollOffset == 0 {
+				m.scrollOffset = m.maxScrollOffset()
+			}
+		}
+		return m, nil
+
 	case runner.StatusUpdateMsg:
 		if msg.CmdIndex >= 0 && msg.CmdIndex < len(m.commands) {
 			m.commands[msg.CmdIndex].Status = msg.Status
@@ -190,16 +203,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				msg.CmdIndex != m.currentCmd {
 				m.currentCmd = msg.CmdIndex
 				m.scrollOffset = 0
+				m.outputLines = nil
 			}
 
 			// Update spinner color to match current status
 			m.spinner.Style = statusStyleFor(msg.Status)
 
-			if msg.CmdIndex == m.currentCmd {
-				m.outputLines = strings.Split(msg.Output, "\n")
-				maxOff := m.maxScrollOffset()
-				if m.scrollOffset >= maxOff-3 || m.scrollOffset == 0 {
-					m.scrollOffset = maxOff
+			// On terminal statuses, reconcile with full output
+			if msg.Status == types.StatusSuccess || msg.Status == types.StatusFailed {
+				if msg.CmdIndex == m.currentCmd && msg.Output != "" {
+					m.outputLines = strings.Split(msg.Output, "\n")
+					maxOff := m.maxScrollOffset()
+					if m.scrollOffset >= maxOff-3 || m.scrollOffset == 0 {
+						m.scrollOffset = maxOff
+					}
 				}
 			}
 		}
@@ -256,6 +273,7 @@ func (m Model) handleKeyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 func (m Model) handlePromptKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	key := msg.String()
+	m.statusMsg = ""
 
 	switch key {
 	case "ctrl+s":
@@ -266,6 +284,7 @@ func (m Model) handlePromptKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.inputMode = "verify"
 			return m, textinput.Blink
 		}
+		m.statusMsg = "Prompt cannot be empty"
 		return m, nil
 
 	case "ctrl+r":
@@ -443,6 +462,7 @@ func (m Model) viewName() string {
 	}
 }
 
+// View renders the current state of the TUI as a string.
 func (m Model) View() string {
 	var b strings.Builder
 
@@ -479,6 +499,11 @@ func (m Model) viewInput() string {
 			b.WriteString("1 command queued\n\n")
 		default:
 			b.WriteString(fmt.Sprintf("%d commands queued\n\n", queueCount))
+		}
+
+		if m.statusMsg != "" {
+			b.WriteString(statusFailed.Render(m.statusMsg))
+			b.WriteString("\n\n")
 		}
 
 		b.WriteString(helpStyle.Render("ctrl+s: submit prompt  |  tab: view queue  |  ctrl+r: run all  |  ctrl+q: quit"))

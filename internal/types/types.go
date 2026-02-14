@@ -13,6 +13,7 @@ const (
 	StatusRetrying                        // 6
 )
 
+// String returns the human-readable label for a CommandStatus value.
 func (s CommandStatus) String() string {
 	labels := []string{
 		"Pending",

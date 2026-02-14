@@ -26,12 +26,13 @@ go install github.com/manasm11/autoclaude@latest
 ## Usage
 
 ```sh
-autoclaude [--max-retries N]
+autoclaude [--max-retries N] [--work-dir DIR]
 ```
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--max-retries` | `3` | Maximum retry attempts per command |
+| `--work-dir` | current directory | Working directory for command execution |
 
 ## Workflow
 
