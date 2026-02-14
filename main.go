@@ -117,8 +117,18 @@ func main() {
 	// Build commands from file and -c flags
 	var commands []*types.Command
 	var fileCount, cliCount int
+	var configSource string // name of the config file loaded (for TUI display)
+	var autoDetected bool   // whether the config file was auto-detected
 
-	// 1. Load from TOML config file first
+	// 1. Auto-detect config file if --file not provided
+	if configFile == "" {
+		if detected := config.DetectConfigFile(wd); detected != "" {
+			configFile = detected
+			autoDetected = true
+		}
+	}
+
+	// 2. Load from TOML config file
 	if configFile != "" {
 		absPath, pathErr := filepath.Abs(configFile)
 		if pathErr != nil {
@@ -133,6 +143,7 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Error loading config file: %v\n", err)
 			os.Exit(1)
 		}
+		configSource = filepath.Base(configFile)
 		// Use config work_dir if no --work-dir flag was given
 		if workDir == "" && cfg.WorkDir != "" {
 			wd = cfg.WorkDir
@@ -145,7 +156,7 @@ func main() {
 		fileCount = len(cfg.Commands)
 	}
 
-	// 2. Append -c flag commands after file commands
+	// 3. Append -c flag commands after file commands
 	for _, raw := range cmds {
 		prompt, verify := parseCmdFlag(raw)
 		if prompt == "" {
@@ -159,14 +170,14 @@ func main() {
 		cliCount++
 	}
 
-	// 3. Apply global --max-retries to any command without its own override
+	// 4. Apply global --max-retries to any command without its own override
 	for _, cmd := range commands {
 		if cmd.MaxRetries <= 0 {
 			cmd.MaxRetries = maxRetries
 		}
 	}
 
-	// 4. Validate --auto-run requires commands
+	// 5. Validate --auto-run requires commands
 	if autoRun && len(commands) == 0 {
 		fmt.Fprintln(os.Stderr, "Error: --auto-run requires commands via --file or --cmd")
 		os.Exit(1)
@@ -194,6 +205,11 @@ func main() {
 		} else if cliCount > 0 {
 			model.SetStatusMsg(fmt.Sprintf("Loaded %d commands from CLI flags", cliCount))
 		}
+	}
+
+	// If commands were auto-loaded from a detected config file, tell the TUI
+	if autoDetected && fileCount > 0 {
+		model.SetAutoLoadInfo(fileCount, configSource)
 	}
 
 	// If auto-run is set and we have commands, start in running state

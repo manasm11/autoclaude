@@ -152,9 +152,28 @@ Pending → Running → Verifying → Committing → Success
 - The CLI `--max-retries` flag sets the global default.
 - On the **first permanent failure**, execution halts — remaining commands stay Pending.
 
+## Config file auto-detection
+
+When no `--file` flag is provided, autoclaude automatically looks for a config file in the working directory in this order:
+
+1. `autoclaude.toml`
+2. `.autoclaude.toml`
+
+If found, commands are loaded automatically — the same as passing `--file`. The TUI queue view shows a subtle info line (e.g. "Loaded 3 commands from autoclaude.toml") so you know where the commands came from.
+
+If the auto-detected file has parse errors, autoclaude prints the error and exits. Since you placed the file there intentionally, silent failures would be confusing.
+
+If `--file` is explicitly provided, auto-detection is skipped — the explicit flag always wins.
+
+```sh
+# Just run autoclaude in a directory with autoclaude.toml — commands load automatically
+cd my-project
+autoclaude
+```
+
 ## Config file naming convention
 
-The suggested name is **`autoclaude.toml`**, placed in your project root. This makes it easy to commit alongside your code and share with teammates.
+The suggested name is **`autoclaude.toml`**, placed in your project root. This makes it easy to commit alongside your code and share with teammates. Use `.autoclaude.toml` if you prefer a hidden dotfile.
 
 The `-f` flag accepts any path, so you can organize configs however you like:
 

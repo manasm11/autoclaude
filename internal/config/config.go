@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/BurntSushi/toml"
 	"github.com/manasm11/autoclaude/internal/types"
@@ -20,6 +21,18 @@ type ConfigFile struct {
 	MaxRetries int             `toml:"max_retries"`
 	WorkDir    string          `toml:"work_dir"`
 	Commands   []ConfigCommand `toml:"command"`
+}
+
+// DetectConfigFile looks for a config file in dir, checking autoclaude.toml
+// then .autoclaude.toml. Returns the path if found, or empty string if neither exists.
+func DetectConfigFile(dir string) string {
+	for _, name := range []string{"autoclaude.toml", ".autoclaude.toml"} {
+		p := filepath.Join(dir, name)
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return ""
 }
 
 // LoadConfig reads and parses a TOML config file from the given path.

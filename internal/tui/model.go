@@ -114,6 +114,8 @@ type Model struct {
 	outputLines   []string
 	statusMsg     string
 	autoRun       bool
+	autoLoadCount int    // number of commands auto-loaded from detected config
+	autoLoadFile  string // filename of auto-detected config (e.g. "autoclaude.toml")
 }
 
 // NewModel creates a new TUI model wired to the given runner.
@@ -154,6 +156,12 @@ func (m *Model) SetCommands(cmds []*types.Command) {
 // SetStatusMsg sets a status message to display on startup (e.g. command load summary).
 func (m *Model) SetStatusMsg(msg string) {
 	m.statusMsg = msg
+}
+
+// SetAutoLoadInfo records that commands were auto-loaded from a detected config file.
+func (m *Model) SetAutoLoadInfo(count int, filename string) {
+	m.autoLoadCount = count
+	m.autoLoadFile = filename
 }
 
 // SetAutoRun configures the model to skip queue review and start execution on init.
@@ -577,6 +585,12 @@ func (m Model) viewQueue() string {
 
 	if m.statusMsg != "" {
 		b.WriteString(helpStyle.Render(m.statusMsg))
+		b.WriteString("\n\n")
+	}
+
+	if m.autoLoadCount > 0 {
+		info := fmt.Sprintf("Loaded %d commands from %s", m.autoLoadCount, m.autoLoadFile)
+		b.WriteString(helpStyle.Render(info))
 		b.WriteString("\n\n")
 	}
 
