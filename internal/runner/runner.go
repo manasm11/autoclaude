@@ -97,88 +97,12 @@ func (r *Runner) RunFrom(startIndex int) {
 }
 
 func (r *Runner) executeAll() {
-	for i, cmd := range r.Commands {
+	for i := range r.Commands {
 		r.CurrentIndex = i
-
-		cmd.Status = types.StatusRunning
-		r.sendUpdate(i, types.StatusRunning, "")
-		r.saveSession()
-
-		success := false
-		for cmd.Attempts < cmd.MaxRetries {
-			cmd.Attempts++
-
-			// Run the claude command
-			output, err := r.runClaude(i, cmd.Prompt)
-			cmd.Output = output
-
-			if err != nil {
-				if cmd.Attempts < cmd.MaxRetries {
-					cmd.Status = types.StatusRetrying
-					r.sendUpdate(i, types.StatusRetrying, output)
-					r.saveSession()
-					continue
-				}
-				// Retries exhausted
-				cmd.Status = types.StatusFailed
-				r.sendUpdate(i, types.StatusFailed, output)
-				r.saveSession()
-				r.sendAllDone()
-				return
-			}
-
-			// Claude succeeded — run verification if configured
-			if cmd.Verify != "" {
-				cmd.Status = types.StatusVerifying
-				r.sendUpdate(i, types.StatusVerifying, cmd.Output)
-				r.saveSession()
-
-				verifyOutput, verifyErr := r.runVerify(i, cmd.Verify)
-				cmd.Output = cmd.Output + "\n" + verifyOutput
-
-				if verifyErr != nil {
-					if cmd.Attempts < cmd.MaxRetries {
-						cmd.Status = types.StatusRetrying
-						r.sendUpdate(i, types.StatusRetrying, cmd.Output)
-						r.saveSession()
-						continue
-					}
-					cmd.Status = types.StatusFailed
-					r.sendUpdate(i, types.StatusFailed, cmd.Output)
-					r.saveSession()
-					r.sendAllDone()
-					return
-				}
-			}
-
-			// Both claude and verify passed
-			success = true
-			break
-		}
-
-		if !success {
-			cmd.Status = types.StatusFailed
-			r.sendUpdate(i, types.StatusFailed, cmd.Output)
-			r.saveSession()
+		if !r.executeSingle(i, r.Commands[i]) {
 			r.sendAllDone()
 			return
 		}
-
-		// Commit and push
-		cmd.Status = types.StatusCommitting
-		r.sendUpdate(i, types.StatusCommitting, cmd.Output)
-		r.saveSession()
-
-		commitOutput, commitErr := r.runClaude(i, "Git add all changes, commit with a concise meaningful commit message describing what was done, and push to origin. Do not ask for confirmation.")
-		if commitErr != nil {
-			cmd.Output = cmd.Output + "\n" + fmt.Sprintf("[warn] git commit/push failed: %v", commitErr)
-		} else {
-			cmd.Output = cmd.Output + "\n" + commitOutput
-		}
-
-		cmd.Status = types.StatusSuccess
-		r.sendUpdate(i, types.StatusSuccess, cmd.Output)
-		r.saveSession()
 	}
 
 	// All commands completed successfully — clear session file since no resume is needed
@@ -188,87 +112,125 @@ func (r *Runner) executeAll() {
 
 func (r *Runner) executeFrom(startIndex int) {
 	for i := startIndex; i < len(r.Commands); i++ {
-		cmd := r.Commands[i]
 		r.CurrentIndex = i
-
-		cmd.Status = types.StatusRunning
-		r.sendUpdate(i, types.StatusRunning, "")
-		r.saveSession()
-
-		success := false
-		for cmd.Attempts < cmd.MaxRetries {
-			cmd.Attempts++
-
-			output, err := r.runClaude(i, cmd.Prompt)
-			cmd.Output = output
-
-			if err != nil {
-				if cmd.Attempts < cmd.MaxRetries {
-					cmd.Status = types.StatusRetrying
-					r.sendUpdate(i, types.StatusRetrying, output)
-					r.saveSession()
-					continue
-				}
-				cmd.Status = types.StatusFailed
-				r.sendUpdate(i, types.StatusFailed, output)
-				r.saveSession()
-				r.sendAllDone()
-				return
-			}
-
-			if cmd.Verify != "" {
-				cmd.Status = types.StatusVerifying
-				r.sendUpdate(i, types.StatusVerifying, cmd.Output)
-				r.saveSession()
-
-				verifyOutput, verifyErr := r.runVerify(i, cmd.Verify)
-				cmd.Output = cmd.Output + "\n" + verifyOutput
-
-				if verifyErr != nil {
-					if cmd.Attempts < cmd.MaxRetries {
-						cmd.Status = types.StatusRetrying
-						r.sendUpdate(i, types.StatusRetrying, cmd.Output)
-						r.saveSession()
-						continue
-					}
-					cmd.Status = types.StatusFailed
-					r.sendUpdate(i, types.StatusFailed, cmd.Output)
-					r.saveSession()
-					r.sendAllDone()
-					return
-				}
-			}
-
-			success = true
-			break
-		}
-
-		if !success {
-			cmd.Status = types.StatusFailed
-			r.sendUpdate(i, types.StatusFailed, cmd.Output)
-			r.saveSession()
+		if !r.executeSingle(i, r.Commands[i]) {
 			r.sendAllDone()
 			return
 		}
-
-		cmd.Status = types.StatusCommitting
-		r.sendUpdate(i, types.StatusCommitting, cmd.Output)
-		r.saveSession()
-
-		commitOutput, commitErr := r.runClaude(i, "Git add all changes, commit with a concise meaningful commit message describing what was done, and push to origin. Do not ask for confirmation.")
-		if commitErr != nil {
-			cmd.Output = cmd.Output + "\n" + fmt.Sprintf("[warn] git commit/push failed: %v", commitErr)
-		} else {
-			cmd.Output = cmd.Output + "\n" + commitOutput
-		}
-
-		cmd.Status = types.StatusSuccess
-		r.sendUpdate(i, types.StatusSuccess, cmd.Output)
-		r.saveSession()
 	}
 
 	session.Clear(r.WorkDir)
 	r.sendAllDone()
+}
+
+// executeSingle runs the full plan-execute-verify-commit cycle for a single command.
+// Returns true if the command succeeded, false if it permanently failed.
+func (r *Runner) executeSingle(i int, cmd *types.Command) bool {
+	success := false
+	for cmd.Attempts < cmd.MaxRetries {
+		cmd.Attempts++
+
+		// 1. PLANNING — skip if we already have a plan (e.g. resumed session)
+		if cmd.PlanOutput == "" {
+			cmd.Status = types.StatusPlanning
+			r.sendUpdate(i, types.StatusPlanning, "")
+			r.saveSession()
+
+			planPrompt := "You are planning the implementation of a task. Create a detailed step-by-step implementation plan. List every file to create or modify, what exact changes to make in each file, function signatures, and edge cases to handle. Do NOT write any code, do NOT create or modify any files. Only output the plan in markdown.\n\nTask: " + cmd.Prompt
+			planOutput, planErr := r.runClaude(i, planPrompt)
+			if planErr != nil {
+				if cmd.Attempts < cmd.MaxRetries {
+					cmd.Status = types.StatusRetrying
+					r.sendUpdate(i, types.StatusRetrying, planOutput)
+					r.saveSession()
+					continue
+				}
+				cmd.Status = types.StatusFailed
+				cmd.Output = planOutput
+				r.sendUpdate(i, types.StatusFailed, planOutput)
+				r.saveSession()
+				return false
+			}
+			cmd.PlanOutput = planOutput
+			r.saveSession()
+		}
+
+		// 2. EXECUTION
+		cmd.Status = types.StatusRunning
+		cmd.Output = "═══ PLAN ═══\n" + cmd.PlanOutput + "\n═══ EXECUTION ═══\n"
+		r.sendUpdate(i, types.StatusRunning, cmd.Output)
+		r.saveSession()
+
+		execPrompt := "Execute the following implementation plan exactly. Follow each step precisely.\n\nPlan:\n" + cmd.PlanOutput + "\n\nOriginal task: " + cmd.Prompt
+		execOutput, execErr := r.runClaude(i, execPrompt)
+		cmd.Output = cmd.Output + execOutput
+
+		if execErr != nil {
+			cmd.PlanOutput = "" // fresh plan on retry
+			if cmd.Attempts < cmd.MaxRetries {
+				cmd.Status = types.StatusRetrying
+				r.sendUpdate(i, types.StatusRetrying, cmd.Output)
+				r.saveSession()
+				continue
+			}
+			cmd.Status = types.StatusFailed
+			r.sendUpdate(i, types.StatusFailed, cmd.Output)
+			r.saveSession()
+			return false
+		}
+
+		// 3. VERIFICATION
+		if cmd.Verify != "" {
+			cmd.Status = types.StatusVerifying
+			r.sendUpdate(i, types.StatusVerifying, cmd.Output)
+			r.saveSession()
+
+			verifyOutput, verifyErr := r.runVerify(i, cmd.Verify)
+			cmd.Output = cmd.Output + "\n" + verifyOutput
+
+			if verifyErr != nil {
+				cmd.PlanOutput = "" // fresh plan on retry
+				if cmd.Attempts < cmd.MaxRetries {
+					cmd.Status = types.StatusRetrying
+					r.sendUpdate(i, types.StatusRetrying, cmd.Output)
+					r.saveSession()
+					continue
+				}
+				cmd.Status = types.StatusFailed
+				r.sendUpdate(i, types.StatusFailed, cmd.Output)
+				r.saveSession()
+				return false
+			}
+		}
+
+		// Plan + execution + verify all passed
+		success = true
+		break
+	}
+
+	if !success {
+		cmd.Status = types.StatusFailed
+		r.sendUpdate(i, types.StatusFailed, cmd.Output)
+		r.saveSession()
+		return false
+	}
+
+	// 4. COMMIT
+	cmd.Status = types.StatusCommitting
+	r.sendUpdate(i, types.StatusCommitting, cmd.Output)
+	r.saveSession()
+
+	commitOutput, commitErr := r.runClaude(i, "Git add all changes, commit with a concise meaningful commit message describing what was done, and push to origin. Do not ask for confirmation.")
+	if commitErr != nil {
+		cmd.Output = cmd.Output + "\n" + fmt.Sprintf("[warn] git commit/push failed: %v", commitErr)
+	} else {
+		cmd.Output = cmd.Output + "\n" + commitOutput
+	}
+
+	cmd.Status = types.StatusSuccess
+	r.sendUpdate(i, types.StatusSuccess, cmd.Output)
+	r.saveSession()
+	return true
 }
 
 func (r *Runner) sendUpdate(index int, status types.CommandStatus, output string) {

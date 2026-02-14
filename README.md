@@ -1,6 +1,6 @@
 # autoclaude
 
-A terminal UI for running a series of [Claude Code](https://docs.anthropic.com/en/docs/claude-code) commands with optional verification and automatic retry support. Queue up multiple prompts, attach shell-based verification commands, and let autoclaude execute them sequentially with git commit/push on success.
+A terminal UI for running a series of [Claude Code](https://docs.anthropic.com/en/docs/claude-code) commands with optional verification and automatic retry support. Each command goes through a two-step plan-then-execute flow: Claude first generates a detailed implementation plan (read-only, no file changes), then executes that plan in a second invocation. Queue up multiple prompts, attach shell-based verification commands, and let autoclaude execute them sequentially with git commit/push on success.
 
 ## Prerequisites
 
@@ -131,15 +131,16 @@ autoclaude -c "Fix the bug::go test ./..." --auto-run
 Each command moves through a sequence of states:
 
 ```
-Pending → Running → Verifying → Committing → Success
-                  ↘            ↘           ↘
-                   Retrying ──→ Failed
+Pending → Planning → Running → Verifying → Committing → Success
+                   ↘         ↘            ↘           ↘
+                    Retrying ────────────→ Failed
 ```
 
 | State | Description |
 |-------|-------------|
 | **Pending** | Queued and waiting to execute |
-| **Running** | Claude Code is processing the prompt |
+| **Planning** | Claude is generating a step-by-step implementation plan (read-only, no file changes) |
+| **Running** | Claude Code is executing the implementation plan |
 | **Verifying** | The `verify` shell command is running (skipped if no verify command is set) |
 | **Committing** | Claude is committing and pushing the changes via git |
 | **Success** | Command completed and changes were committed |
@@ -148,7 +149,7 @@ Pending → Running → Verifying → Committing → Success
 
 ### Retry behavior
 
-- When Claude or the verification step fails, the command enters **Retrying** and the full cycle repeats from **Running**.
+- When Claude or the verification step fails, the command enters **Retrying** and the full cycle repeats from **Planning** with a fresh plan.
 - Each command tracks its own attempt count against its `max_retries` limit.
 - Per-command `max_retries` in the TOML config overrides the global value.
 - The CLI `--max-retries` flag sets the global default.

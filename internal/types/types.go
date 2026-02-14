@@ -5,18 +5,20 @@ type CommandStatus int
 
 const (
 	StatusPending    CommandStatus = iota // 0
-	StatusRunning                         // 1
-	StatusVerifying                       // 2
-	StatusCommitting                      // 3
-	StatusSuccess                         // 4
-	StatusFailed                          // 5
-	StatusRetrying                        // 6
+	StatusPlanning                        // 1
+	StatusRunning                         // 2
+	StatusVerifying                       // 3
+	StatusCommitting                      // 4
+	StatusSuccess                         // 5
+	StatusFailed                          // 6
+	StatusRetrying                        // 7
 )
 
 // String returns the human-readable label for a CommandStatus value.
 func (s CommandStatus) String() string {
 	labels := []string{
 		"Pending",
+		"Planning",
 		"Running",
 		"Verifying",
 		"Committing",
@@ -37,6 +39,7 @@ type Command struct {
 	MaxRetries int           // default 3
 	Status     CommandStatus // current execution status
 	Output     string        // captured stdout/stderr
+	PlanOutput string        // output from the planning phase
 	Attempts   int           // number of attempts made
 }
 
@@ -54,6 +57,8 @@ func ParseCommandStatus(s string) CommandStatus {
 	switch s {
 	case "Pending":
 		return StatusPending
+	case "Planning":
+		return StatusPlanning
 	case "Running":
 		return StatusRunning
 	case "Verifying":
@@ -79,6 +84,7 @@ type SessionCommand struct {
 	Status     string `json:"status"`
 	Attempts   int    `json:"attempts"`
 	Output     string `json:"output,omitempty"`
+	PlanOutput string `json:"plan_output,omitempty"`
 }
 
 // ToSessionCommand converts a Command to a SessionCommand for serialization.
@@ -90,6 +96,7 @@ func (c *Command) ToSessionCommand() SessionCommand {
 		Status:     c.Status.String(),
 		Attempts:   c.Attempts,
 		Output:     c.Output,
+		PlanOutput: c.PlanOutput,
 	}
 }
 
@@ -102,5 +109,6 @@ func FromSessionCommand(sc SessionCommand) *Command {
 		Status:     ParseCommandStatus(sc.Status),
 		Attempts:   sc.Attempts,
 		Output:     sc.Output,
+		PlanOutput: sc.PlanOutput,
 	}
 }

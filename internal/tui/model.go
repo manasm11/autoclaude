@@ -65,6 +65,9 @@ var (
 	statusPending = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#808080"))
 
+	statusPlanning = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#FFFFFF"))
+
 	statusRunning = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#5B9BF5"))
 
@@ -340,7 +343,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.commands[msg.CmdIndex].Status = msg.Status
 			m.commands[msg.CmdIndex].Output = msg.Output
 
-			if (msg.Status == types.StatusRunning || msg.Status == types.StatusVerifying ||
+			if (msg.Status == types.StatusPlanning || msg.Status == types.StatusRunning || msg.Status == types.StatusVerifying ||
 				msg.Status == types.StatusCommitting || msg.Status == types.StatusRetrying) &&
 				msg.CmdIndex != m.currentCmd {
 				m.currentCmd = msg.CmdIndex
@@ -912,6 +915,8 @@ func statusStyleFor(s types.CommandStatus) lipgloss.Style {
 	switch s {
 	case types.StatusPending:
 		return statusPending
+	case types.StatusPlanning:
+		return statusPlanning
 	case types.StatusRunning:
 		return statusRunning
 	case types.StatusVerifying:
@@ -1094,6 +1099,8 @@ func statusIcon(s types.CommandStatus) string {
 	switch s {
 	case types.StatusPending:
 		return "\u25cb" // ○
+	case types.StatusPlanning:
+		return "\u270e" // ✎
 	case types.StatusRunning:
 		return "\u25cf" // ●
 	case types.StatusVerifying:
