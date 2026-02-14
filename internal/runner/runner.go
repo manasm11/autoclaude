@@ -43,6 +43,7 @@ type Runner struct {
 	CurrentIndex int
 	WorkDir      string
 	MaxRetries   int
+	NoDocs       bool
 	program      *tea.Program
 	ctx          context.Context
 	cancel       context.CancelFunc
@@ -215,7 +216,23 @@ func (r *Runner) executeSingle(i int, cmd *types.Command) bool {
 		return false
 	}
 
-	// 4. COMMIT
+	// 4. DOCUMENTATION (non-fatal)
+	if !r.NoDocs {
+		cmd.Status = types.StatusDocumenting
+		r.sendUpdate(i, types.StatusDocumenting, cmd.Output)
+		r.saveSession()
+
+		docPrompt := "Review the changes just made in this project. Update the following documentation files to reflect these changes:\n\n1. CLAUDE.md — This is the project memory file for Claude Code. Update it with any new conventions, architecture decisions, file structure changes, dependencies added, or important patterns established by the recent changes. Create the file if it doesn't exist. Keep it concise and useful as a reference for future Claude Code sessions.\n\n2. README.md — Update the user-facing documentation to reflect any new features, usage changes, API changes, or configuration options introduced by the recent changes. Create the file if it doesn't exist. Do not remove existing content unless it's outdated due to the changes.\n\nOnly update sections relevant to the recent changes. Do not rewrite unrelated sections. If no documentation updates are needed, make no changes.\n\nRecent task that was executed: " + cmd.Prompt
+		docOutput, docErr := r.runClaude(i, docPrompt)
+		if docErr != nil {
+			cmd.Output = cmd.Output + "\n═══ DOCUMENTATION ═══\n" + fmt.Sprintf("[warn] documentation update failed: %v", docErr)
+		} else {
+			cmd.Output = cmd.Output + "\n═══ DOCUMENTATION ═══\n" + docOutput
+		}
+		r.sendUpdate(i, types.StatusDocumenting, cmd.Output)
+	}
+
+	// 5. COMMIT
 	cmd.Status = types.StatusCommitting
 	r.sendUpdate(i, types.StatusCommitting, cmd.Output)
 	r.saveSession()

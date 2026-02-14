@@ -48,6 +48,7 @@ Flags:
   -w, --work-dir string   Working directory (default: current directory)
   -a, --auto-run          Skip TUI queue review and start execution immediately
   -R, --no-resume         Skip session detection and start fresh (clears any existing session)
+      --no-docs           Skip automatic documentation update step
       --clear-session     Delete any existing session file and exit
   -h, --help              Show this help message
 
@@ -93,6 +94,7 @@ func main() {
 		workDir      string
 		autoRun      bool
 		noResume     bool
+		noDocs       bool
 		clearSession bool
 		showHelp     bool
 	)
@@ -104,6 +106,7 @@ func main() {
 	flag.StringVar(&workDir, "work-dir", "", "working directory for command execution (defaults to current directory)")
 	flag.BoolVar(&autoRun, "auto-run", false, "skip TUI queue review and start execution immediately")
 	flag.BoolVar(&noResume, "no-resume", false, "skip session detection and start fresh")
+	flag.BoolVar(&noDocs, "no-docs", false, "skip automatic documentation update step")
 	flag.BoolVar(&clearSession, "clear-session", false, "delete any existing session file and exit")
 	flag.BoolVar(&showHelp, "help", false, "show usage with examples")
 
@@ -199,8 +202,9 @@ func main() {
 	// Build commands from file and -c flags
 	var commands []*types.Command
 	var fileCount, cliCount int
-	var configSource string // name of the config file loaded (for TUI display)
-	var autoDetected bool   // whether the config file was auto-detected
+	var configSource string          // name of the config file loaded (for TUI display)
+	var autoDetected bool            // whether the config file was auto-detected
+	var cfg *config.ConfigFile       // parsed config (nil if no config file)
 
 	// 1. Auto-detect config file if --file not provided
 	if configFile == "" {
@@ -220,9 +224,10 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Error: config file not found: %s\n", absPath)
 			os.Exit(1)
 		}
-		cfg, err := config.LoadConfig(configFile)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error loading config file: %v\n", err)
+		var cfgErr error
+		cfg, cfgErr = config.LoadConfig(configFile)
+		if cfgErr != nil {
+			fmt.Fprintf(os.Stderr, "Error loading config file: %v\n", cfgErr)
 			os.Exit(1)
 		}
 		configSource = filepath.Base(configFile)
@@ -267,6 +272,15 @@ func main() {
 
 	r := runner.NewRunner(wd)
 	r.MaxRetries = maxRetries
+
+	// Determine whether to skip documentation updates.
+	// --no-docs flag takes priority over TOML update_docs setting.
+	// Default is false (docs enabled) when neither flag nor config is set.
+	if noDocs {
+		r.NoDocs = true
+	} else if cfg != nil && cfg.UpdateDocs != nil && !*cfg.UpdateDocs {
+		r.NoDocs = true
+	}
 
 	// Add all pre-loaded commands to the runner
 	for _, cmd := range commands {

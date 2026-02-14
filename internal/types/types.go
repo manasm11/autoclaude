@@ -8,10 +8,11 @@ const (
 	StatusPlanning                        // 1
 	StatusRunning                         // 2
 	StatusVerifying                       // 3
-	StatusCommitting                      // 4
-	StatusSuccess                         // 5
-	StatusFailed                          // 6
-	StatusRetrying                        // 7
+	StatusDocumenting                     // 4
+	StatusCommitting                      // 5
+	StatusSuccess                         // 6
+	StatusFailed                          // 7
+	StatusRetrying                        // 8
 )
 
 // String returns the human-readable label for a CommandStatus value.
@@ -21,6 +22,7 @@ func (s CommandStatus) String() string {
 		"Planning",
 		"Running",
 		"Verifying",
+		"Documenting",
 		"Committing",
 		"Success",
 		"Failed",
@@ -63,6 +65,8 @@ func ParseCommandStatus(s string) CommandStatus {
 		return StatusRunning
 	case "Verifying":
 		return StatusVerifying
+	case "Documenting":
+		return StatusDocumenting
 	case "Committing":
 		return StatusCommitting
 	case "Success":

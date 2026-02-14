@@ -20,6 +20,7 @@ type ConfigCommand struct {
 type ConfigFile struct {
 	MaxRetries int             `toml:"max_retries"`
 	WorkDir    string          `toml:"work_dir"`
+	UpdateDocs *bool           `toml:"update_docs"`
 	Commands   []ConfigCommand `toml:"command"`
 }
 

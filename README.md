@@ -100,6 +100,7 @@ max_retries = 10
 |-------|-------|----------|---------|-------------|
 | `max_retries` | global | no | `3` | Default retry limit for all commands |
 | `work_dir` | global | no | current dir | Working directory for execution |
+| `update_docs` | global | no | `true` | Auto-update CLAUDE.md and README.md after each command |
 | `prompt` | command | **yes** | — | The Claude Code prompt to run |
 | `verify` | command | no | — | Shell command to verify success (exit 0 = pass) |
 | `max_retries` | command | no | global value | Per-command retry override |
@@ -157,6 +158,7 @@ autoclaude -c "Fix the bug::go test ./..." --auto-run
 | `-w` | `--work-dir` | string | current dir | Working directory for execution |
 | `-a` | `--auto-run` | bool | `false` | Skip TUI review, start immediately |
 | `-R` | `--no-resume` | bool | `false` | Skip session detection and start fresh |
+| | `--no-docs` | bool | `false` | Skip automatic documentation update step |
 | | `--clear-session` | bool | `false` | Delete any existing session file and exit |
 | `-h` | `--help` | bool | `false` | Show help message |
 
@@ -165,9 +167,9 @@ autoclaude -c "Fix the bug::go test ./..." --auto-run
 Each command moves through a sequence of states:
 
 ```
-Pending → Planning → Running → Verifying → Committing → Success
-                   ↘         ↘            ↘           ↘
-                    Retrying ────────────→ Failed
+Pending → Planning → Running → Verifying → Documenting → Committing → Success
+                   ↘         ↘            ↘              ↘           ↘
+                    Retrying ─────────────────────────→ Failed
 ```
 
 | State | Description |
@@ -176,6 +178,7 @@ Pending → Planning → Running → Verifying → Committing → Success
 | **Planning** | Claude is generating a step-by-step implementation plan (read-only, no file changes) |
 | **Running** | Claude Code is executing the implementation plan |
 | **Verifying** | The `verify` shell command is running (skipped if no verify command is set) |
+| **Documenting** | Claude is updating CLAUDE.md and README.md to reflect the changes (non-fatal if it fails) |
 | **Committing** | Claude is committing and pushing the changes via git |
 | **Success** | Command completed and changes were committed |
 | **Failed** | All retry attempts exhausted — execution stops |
@@ -188,6 +191,35 @@ Pending → Planning → Running → Verifying → Committing → Success
 - Per-command `max_retries` in the TOML config overrides the global value.
 - The CLI `--max-retries` flag sets the global default.
 - On the **first permanent failure**, execution halts — remaining commands stay Pending.
+
+## Automatic documentation updates
+
+After each command completes verification (or execution if no verify step is set), autoclaude automatically asks Claude to update project documentation before committing:
+
+- **CLAUDE.md** — The project memory file for Claude Code. Updated with new conventions, architecture decisions, file structure changes, dependencies, and patterns established by the recent changes. Created if it doesn't exist.
+- **README.md** — User-facing documentation. Updated with new features, usage changes, API changes, or configuration options. Created if it doesn't exist. Existing content is preserved unless outdated.
+
+Only sections relevant to the recent changes are modified. If no documentation updates are needed, no changes are made.
+
+### Non-fatal behavior
+
+Documentation updates are **non-fatal** — if the step fails, a warning is appended to the command output and execution proceeds to the commit step. The actual work is done; docs are nice-to-have.
+
+### Disabling documentation updates
+
+Use the `--no-docs` flag to skip the documentation step entirely:
+
+```sh
+autoclaude -f commands.toml --no-docs
+```
+
+Or disable it in your TOML config file:
+
+```toml
+update_docs = false
+```
+
+The `--no-docs` flag takes priority over the TOML `update_docs` setting.
 
 ## Session resume
 

@@ -74,6 +74,9 @@ var (
 	statusVerifying = lipgloss.NewStyle().
 				Foreground(lipgloss.Color("#00CED1"))
 
+	statusDocumenting = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#87CEEB"))
+
 	statusCommitting = lipgloss.NewStyle().
 				Foreground(lipgloss.Color("#DA70D6"))
 
@@ -344,7 +347,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.commands[msg.CmdIndex].Output = msg.Output
 
 			if (msg.Status == types.StatusPlanning || msg.Status == types.StatusRunning || msg.Status == types.StatusVerifying ||
-				msg.Status == types.StatusCommitting || msg.Status == types.StatusRetrying) &&
+				msg.Status == types.StatusDocumenting || msg.Status == types.StatusCommitting || msg.Status == types.StatusRetrying) &&
 				msg.CmdIndex != m.currentCmd {
 				m.currentCmd = msg.CmdIndex
 				m.scrollOffset = 0
@@ -921,6 +924,8 @@ func statusStyleFor(s types.CommandStatus) lipgloss.Style {
 		return statusRunning
 	case types.StatusVerifying:
 		return statusVerifying
+	case types.StatusDocumenting:
+		return statusDocumenting
 	case types.StatusCommitting:
 		return statusCommitting
 	case types.StatusSuccess:
@@ -1105,6 +1110,8 @@ func statusIcon(s types.CommandStatus) string {
 		return "\u25cf" // ●
 	case types.StatusVerifying:
 		return "\u25ce" // ◎
+	case types.StatusDocumenting:
+		return "\u270d" // ✍
 	case types.StatusCommitting:
 		return "\u25c9" // ◉
 	case types.StatusSuccess:
