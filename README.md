@@ -81,6 +81,7 @@ autoclaude -f autoclaude.toml
 # Global settings
 max_retries = 5
 work_dir = "/path/to/project"
+# auto_fix = true  # auto-fix failures using Claude (default: true)
 
 # Each [[command]] block is one Claude Code prompt.
 [[command]]
@@ -94,6 +95,10 @@ verify = "go test ./internal/auth/..."
 prompt = "Refactor the DB pool"
 verify = "go test -race ./internal/db/..."
 max_retries = 10
+
+[[command]]
+prompt = "Quick one-shot task that should not retry"
+auto_fix = false  # fail immediately on error, no fix attempts
 ```
 
 | Field | Scope | Required | Default | Description |
@@ -101,9 +106,11 @@ max_retries = 10
 | `max_retries` | global | no | `3` | Default retry limit for all commands |
 | `work_dir` | global | no | current dir | Working directory for execution |
 | `update_docs` | global | no | `true` | Auto-update CLAUDE.md and README.md after each command |
+| `auto_fix` | global | no | `true` | Auto-fix failures using Claude (set `false` to fail immediately) |
 | `prompt` | command | **yes** | — | The Claude Code prompt to run |
 | `verify` | command | no | — | Shell command to verify success (exit 0 = pass) |
 | `max_retries` | command | no | global value | Per-command retry override |
+| `auto_fix` | command | no | global value | Per-command auto-fix override |
 
 See [`example.autoclaude.toml`](example.autoclaude.toml) for a fully commented example.
 
@@ -160,6 +167,7 @@ autoclaude -c "Fix the bug::go test ./..." --auto-run
 | `-R` | `--no-resume` | bool | `false` | Skip session detection and start fresh |
 | | `--reset-attempts` | bool | `false` | Reset attempt counters on resume (gives full retry budget) |
 | | `--no-docs` | bool | `false` | Skip automatic documentation update step |
+| | `--no-auto-fix` | bool | `false` | Disable auto-fix on failure (fail immediately) |
 | | `--clear-session` | bool | `false` | Delete any existing session file and exit |
 | `-h` | `--help` | bool | `false` | Show help message |
 
@@ -187,14 +195,53 @@ Pending → Planning → Running → Verifying → Documenting → Committing �
 
 ### Retry and auto-fix behavior
 
+When a command fails at the planning, execution, or verification step, autoclaude can automatically attempt to fix the issue using Claude. The auto-fix flow works like this:
+
+1. **Failure detected** — the failed step, exit code, stdout, and stderr are captured
+2. **Fix prompt** — the error details are fed back to Claude along with the original task and plan, asking it to make targeted fixes
+3. **Re-verify** — after Claude applies fixes, only the verification step re-runs (no re-planning or re-execution)
+4. **Repeat** — if verification fails again, the cycle repeats up to the `max_retries` budget
+
+Key details:
+
 - `max_retries` means **total attempts**, not additional retries. `max_retries = 3` means the command gets at most 3 chances (1 initial + 2 fix attempts).
-- When Claude or the verification step fails, the error details (failed step, exit code, stdout, stderr) are captured and fed back to Claude as an auto-fix prompt. Claude analyzes the error and makes targeted fixes, then verification re-runs.
 - Each fix attempt is preceded by a 2-second cooldown.
 - **Documenting** and **Committing** failures are non-fatal and never trigger fix attempts — the command still succeeds.
 - Each command tracks its own attempt count against its `max_retries` limit.
 - Per-command `max_retries` in the TOML config overrides the global value.
 - The CLI `--max-retries` flag sets the global default.
 - On the **first permanent failure**, execution halts — remaining commands stay Pending.
+
+### Disabling auto-fix
+
+Auto-fix is enabled by default. To disable it (fail immediately on any error with no fix attempts):
+
+**CLI flag** (overrides everything):
+
+```sh
+autoclaude -f commands.toml --no-auto-fix
+```
+
+**TOML global setting** (applies to all commands in the file):
+
+```toml
+auto_fix = false
+```
+
+**TOML per-command override** (overrides the global setting for one command):
+
+```toml
+auto_fix = true  # global: auto-fix enabled
+
+[[command]]
+prompt = "This command will auto-fix on failure"
+
+[[command]]
+prompt = "This command fails immediately on error"
+auto_fix = false
+```
+
+The `--no-auto-fix` flag takes priority over all TOML `auto_fix` settings, matching the precedence pattern of `--no-docs`.
 
 ### Attempt logging
 

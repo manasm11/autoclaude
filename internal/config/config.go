@@ -14,6 +14,7 @@ type ConfigCommand struct {
 	Prompt     string `toml:"prompt"`
 	Verify     string `toml:"verify"`
 	MaxRetries int    `toml:"max_retries"`
+	AutoFix    *bool  `toml:"auto_fix"`
 }
 
 // ConfigFile represents the top-level structure of an autoclaude TOML config file.
@@ -21,6 +22,7 @@ type ConfigFile struct {
 	MaxRetries int             `toml:"max_retries"`
 	WorkDir    string          `toml:"work_dir"`
 	UpdateDocs *bool           `toml:"update_docs"`
+	AutoFix    *bool           `toml:"auto_fix"`
 	Commands   []ConfigCommand `toml:"command"`
 }
 
@@ -74,6 +76,7 @@ func LoadConfig(path string) (*ConfigFile, error) {
 
 // ToCommands converts the parsed config into a slice of types.Command.
 // Per-command max_retries overrides the global value when set.
+// Per-command auto_fix overrides the global value when set; default is true.
 func (cfg *ConfigFile) ToCommands() []*types.Command {
 	cmds := make([]*types.Command, len(cfg.Commands))
 	for i, cc := range cfg.Commands {
@@ -81,10 +84,19 @@ func (cfg *ConfigFile) ToCommands() []*types.Command {
 		if cc.MaxRetries != 0 {
 			retries = cc.MaxRetries
 		}
+		// Resolve auto_fix: per-command > global > default (true)
+		autoFix := true
+		if cfg.AutoFix != nil {
+			autoFix = *cfg.AutoFix
+		}
+		if cc.AutoFix != nil {
+			autoFix = *cc.AutoFix
+		}
 		cmds[i] = &types.Command{
 			Prompt:     cc.Prompt,
 			Verify:     cc.Verify,
 			MaxRetries: retries,
+			AutoFix:    autoFix,
 			Status:     types.StatusPending,
 		}
 	}

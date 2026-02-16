@@ -234,6 +234,10 @@ func (r *Runner) executeSingle(i int, cmd *types.Command) bool {
 			finalizeAttempt(attemptLog, "Planning", planResult.ExitCode)
 			cmd.Output += planOutput
 			recordFailure("planning", planResult.ExitCode, planResult.Stdout, planResult.Stderr)
+			if !cmd.AutoFix {
+				sendFailed()
+				return false
+			}
 			goto fixLoop
 		}
 		cmd.PlanOutput = planOutput
@@ -257,6 +261,10 @@ func (r *Runner) executeSingle(i int, cmd *types.Command) bool {
 		if execErr != nil {
 			finalizeAttempt(attemptLog, "Running", execResult.ExitCode)
 			recordFailure("execution", execResult.ExitCode, execResult.Stdout, execResult.Stderr)
+			if !cmd.AutoFix {
+				sendFailed()
+				return false
+			}
 			goto fixLoop
 		}
 	}
@@ -276,6 +284,10 @@ func (r *Runner) executeSingle(i int, cmd *types.Command) bool {
 		if verifyErr != nil {
 			finalizeAttempt(attemptLog, "Verifying", verifyResult.ExitCode)
 			recordFailure("verification", verifyResult.ExitCode, verifyResult.Stdout, verifyResult.Stderr)
+			if !cmd.AutoFix {
+				sendFailed()
+				return false
+			}
 			goto fixLoop
 		}
 	}

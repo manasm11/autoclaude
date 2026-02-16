@@ -63,6 +63,7 @@ type Command struct {
 	Prompt     string        // the claude code prompt
 	Verify     string        // optional verification command (empty = no verification)
 	MaxRetries int           // default 3
+	AutoFix    bool          // whether to attempt auto-fix on failure (default true)
 	Status     CommandStatus // current execution status
 	Output     string        // captured stdout/stderr
 	PlanOutput string        // output from the planning phase
@@ -78,8 +79,9 @@ type Command struct {
 // NewCommand creates a new Command with sensible defaults.
 func NewCommand(prompt string) *Command {
 	return &Command{
-		Prompt: prompt,
-		Status: StatusPending,
+		Prompt:  prompt,
+		AutoFix: true,
+		Status:  StatusPending,
 	}
 }
 
@@ -201,6 +203,7 @@ type SessionCommand struct {
 	Prompt         string              `json:"prompt"`
 	Verify         string              `json:"verify,omitempty"`
 	MaxRetries     int                 `json:"max_retries"`
+	AutoFix        *bool               `json:"auto_fix,omitempty"`
 	Status         string              `json:"status"`
 	Attempts       int                 `json:"attempts"`
 	FixAttempts    int                 `json:"fix_attempts,omitempty"`
@@ -232,10 +235,12 @@ func (c *Command) ToSessionCommand() SessionCommand {
 			GitStatus:     a.GitStatus,
 		})
 	}
+	autoFix := c.AutoFix
 	return SessionCommand{
 		Prompt:         c.Prompt,
 		Verify:         c.Verify,
 		MaxRetries:     c.MaxRetries,
+		AutoFix:        &autoFix,
 		Status:         c.Status.String(),
 		Attempts:       c.Attempts,
 		FixAttempts:    c.FixAttempts,
@@ -270,10 +275,16 @@ func FromSessionCommand(sc SessionCommand) *Command {
 			GitStatus:     sa.GitStatus,
 		})
 	}
+	// Default AutoFix to true when missing from old session files.
+	autoFix := true
+	if sc.AutoFix != nil {
+		autoFix = *sc.AutoFix
+	}
 	return &Command{
 		Prompt:         sc.Prompt,
 		Verify:         sc.Verify,
 		MaxRetries:     sc.MaxRetries,
+		AutoFix:        autoFix,
 		Status:         ParseCommandStatus(sc.Status),
 		Attempts:       sc.Attempts,
 		FixAttempts:    sc.FixAttempts,

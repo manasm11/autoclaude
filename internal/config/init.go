@@ -14,6 +14,7 @@ const sampleConfig = `# autoclaude configuration file
 max_retries = 3
 # work_dir = "."  # defaults to current directory
 # update_docs = true  # auto-update CLAUDE.md and README.md after each command (default: true)
+# auto_fix = true  # auto-fix failures using Claude (default: true)
 
 # Each [[command]] block defines a Claude Code task to run sequentially.
 # After each successful command, changes are auto-committed and pushed.

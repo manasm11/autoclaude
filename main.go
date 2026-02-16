@@ -50,6 +50,7 @@ Flags:
   -R, --no-resume         Skip session detection and start fresh (clears any existing session)
       --reset-attempts    Reset attempt counters on resume (gives full retry budget)
       --no-docs           Skip automatic documentation update step
+      --no-auto-fix       Disable auto-fix on failure (fail immediately)
       --clear-session     Delete any existing session file and exit
   -h, --help              Show this help message
 
@@ -97,6 +98,7 @@ func main() {
 		noResume      bool
 		resetAttempts bool
 		noDocs        bool
+		noAutoFix     bool
 		clearSession  bool
 		showHelp      bool
 	)
@@ -110,6 +112,7 @@ func main() {
 	flag.BoolVar(&noResume, "no-resume", false, "skip session detection and start fresh")
 	flag.BoolVar(&resetAttempts, "reset-attempts", false, "reset attempt counters on resume (gives full retry budget)")
 	flag.BoolVar(&noDocs, "no-docs", false, "skip automatic documentation update step")
+	flag.BoolVar(&noAutoFix, "no-auto-fix", false, "disable auto-fix on failure (fail immediately)")
 	flag.BoolVar(&clearSession, "clear-session", false, "delete any existing session file and exit")
 	flag.BoolVar(&showHelp, "help", false, "show usage with examples")
 
@@ -283,6 +286,13 @@ func main() {
 		r.NoDocs = true
 	} else if cfg != nil && cfg.UpdateDocs != nil && !*cfg.UpdateDocs {
 		r.NoDocs = true
+	}
+
+	// Apply --no-auto-fix: overrides TOML auto_fix settings for all commands.
+	if noAutoFix {
+		for _, cmd := range commands {
+			cmd.AutoFix = false
+		}
 	}
 
 	// Add all pre-loaded commands to the runner

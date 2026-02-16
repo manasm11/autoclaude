@@ -50,6 +50,7 @@ The old retry-from-planning loop has been replaced with an auto-fix system. On f
 #### Type-level support (internal/types/types.go)
 
 - **`StatusFixing`** (iota 9): Command status for when Claude is auto-fixing a failure. Appended after `StatusRetrying` — no existing iota values shift.
+- **`AutoFix` field on `Command`**: `bool`, default `true`. When `false`, any failure at Planning/Running/Verifying goes directly to `StatusFailed` without entering the fix loop. Set via TOML config (`auto_fix`), `NewCommand()` default, or CLI `--no-auto-fix` override. Persisted in `SessionCommand` as `*bool` (JSON key: `auto_fix`, `omitempty`) — `nil` on deserialization from old session files defaults to `true`.
 - **Auto-fix fields on `Command`**: `LastFailedStep` (string: `"planning"`, `"execution"`, or `"verification"`), `LastExitCode` (int), `LastStderr`/`LastStdout` (string), `FixAttempts` (int counter). These track the most recent failure and are replaced (not accumulated) on each failure. Zero values mean "no failure recorded". All five fields are persisted in `SessionCommand` (JSON keys: `last_failed_step`, `last_exit_code`, `last_stderr`, `last_stdout`, `fix_attempts`) so that session resume restores fix state correctly. Old session files missing these keys deserialize to zero values, which is the correct "no failure recorded" semantic.
 - **`BuildFixPrompt()`**: Method on `*Command` that constructs a prompt for Claude to fix the issue. Includes: original task prompt, failed step, exit code, plan (if available), stdout, stderr, and a clear instruction to make targeted fixes. Conditionally omits empty sections (PlanOutput, LastStdout, LastStderr).
 - **`StatusRetrying`** is still present in the iota block and `String()` labels for backward compatibility (preserves iota values so `StatusFixing = 9`). Removed from `ParseCommandStatus()` — old sessions with `"Retrying"` status now deserialize to `StatusPending` (the default case), causing them to restart from the beginning on resume.
@@ -57,6 +58,7 @@ The old retry-from-planning loop has been replaced with an auto-fix system. On f
 #### Runner auto-fix flow (internal/runner/runner.go)
 
 - **`executeSingle` structure**: Linear initial attempt (plan → execute → verify) followed by a `fixLoop:` label for auto-fix iterations. Uses `goto fixLoop` from three failure points (planning, execution, verification) and `goto success` when the initial attempt passes. No retry loop wrapping the initial attempt.
+- **Auto-fix guard**: At each of the three `goto fixLoop` sites, `cmd.AutoFix` is checked first. If `false`, calls `sendFailed()` and returns immediately — the fix loop is never entered.
 - **`recordFailure` closure**: Populates `cmd.LastFailedStep`, `cmd.LastExitCode`, `cmd.LastStdout`, `cmd.LastStderr` before entering the fix loop. These fields are read by `cmd.BuildFixPrompt()`.
 - **`sendFailed` closure**: Encapsulates the failure path — sets `StatusFailed`, saves session, writes failure report, sends `ExecutionErrorMsg`.
 - **Fix loop semantics**: `cmd.FixAttempts` incremented at start of each iteration. Budget check: `FixAttempts >= MaxRetries` → fail. With `MaxRetries=3`: initial attempt + 2 fix attempts = 3 total tries.
@@ -91,7 +93,15 @@ The old retry-from-planning loop has been replaced with an auto-fix system. On f
 
 ### Execution flow
 
-Each command goes through: Pending -> Planning -> Running -> Verifying -> Documenting -> Committing -> Success. On failure at any of Planning/Running/Verifying: fail -> StatusFixing -> run Claude with `BuildFixPrompt()` -> re-verify only -> repeat up to `max_retries` times. The fix loop does not re-plan or re-execute — Claude fixes code directly and verification confirms the fix.
+Each command goes through: Pending -> Planning -> Running -> Verifying -> Documenting -> Committing -> Success. On failure at any of Planning/Running/Verifying: if `cmd.AutoFix` is true, enter fix loop (StatusFixing -> run Claude with `BuildFixPrompt()` -> re-verify only -> repeat up to `max_retries` times). If `cmd.AutoFix` is false, fail immediately without fix attempts. The fix loop does not re-plan or re-execute — Claude fixes code directly and verification confirms the fix.
+
+### Auto-fix configuration (internal/config/config.go, main.go)
+
+- **TOML config**: `AutoFix *bool` on both `ConfigFile` (global) and `ConfigCommand` (per-command). Uses `*bool` (pointer) to distinguish "not set" (`nil`) from "explicitly false" — same pattern as `UpdateDocs`.
+- **Resolution precedence in `ToCommands()`**: per-command `auto_fix` > global `auto_fix` > default (`true`).
+- **CLI flag**: `--no-auto-fix` (`flag.BoolVar`) in `main.go`. When set, loops through all commands and sets `cmd.AutoFix = false`, overriding all TOML settings. Applied after TOML resolution, before commands are added to the runner. Matches the precedence pattern of `--no-docs`.
+- **`NewCommand()` default**: `AutoFix: true` — ensures CLI `-c` commands (which bypass TOML) default to auto-fix enabled.
+- **Session persistence**: `SessionCommand.AutoFix` is `*bool` with `json:"auto_fix,omitempty"`. Old session files missing this key deserialize to `nil`, which `FromSessionCommand()` defaults to `true`. `--reset-attempts` does NOT reset `AutoFix` (it's a config setting, not execution state).
 
 ### Dependencies
 
