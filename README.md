@@ -320,6 +320,24 @@ autoclaude.tests.toml    # test-focused commands
 autoclaude.refactor.toml # refactoring batch
 ```
 
+## Failure logging
+
+When a command permanently fails (all retry attempts exhausted), autoclaude writes a detailed failure report to `autoclaude-error.log` in the working directory. The file is append-only — each failure adds a timestamped entry, so logs accumulate across runs.
+
+Each entry includes:
+- Timestamp and command prompt
+- Per-attempt details: failed step, exit code, duration, stdout/stderr
+- Git context (branch, status) at the time of each attempt
+
+The log file is included in `.gitignore` by default.
+
+When execution finishes with failures, the TUI shows a failure panel with:
+- Command number, prompt, attempt count, last failed step, and exit code
+- Scrollable last-attempt stderr
+- Press `l` to expand the full failure report showing all attempts with stdout/stderr
+
+This file is useful for debugging failures in `--auto-run` mode where the TUI is non-interactive.
+
 ## Keybindings
 
 ### Input view
@@ -364,6 +382,7 @@ autoclaude.refactor.toml # refactoring batch
 |-----|--------|
 | `j` / `Down` | Scroll output down |
 | `k` / `Up` | Scroll output up |
+| `l` | Toggle expanded failure log (after execution) |
 | `q` | Quit (after execution completes) |
 | `Ctrl+C` | Force quit |
 

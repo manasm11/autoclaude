@@ -50,6 +50,12 @@ go test ./...
 - **Verification failure retries the full cycle** — `cmd.PlanOutput` is cleared so the next attempt starts from Planning, not just re-verification.
 - **Attempt detail in TUI**: `StatusUpdateMsg.StatusDetail` carries "Attempt N/M" for retry-eligible steps. The TUI displays this next to the spinner via `model.statusDetail`.
 
+### Failure reporting (internal/runner/runner.go)
+
+- **`writeFailureReport(cmd)`**: Formats a timestamped failure report header (prompt truncated to 100 chars, RFC3339 timestamp, box-drawing separators) + `cmd.FormatFailureReport()` body. Appends to `autoclaude-error.log` in `r.WorkDir` via `os.OpenFile` with `O_APPEND|O_CREATE|O_WRONLY`. File write errors are non-fatal (warning appended to `cmd.Output`). Returns the full report string.
+- **`ExecutionErrorMsg`** carries `FailureReport string` alongside `CmdIndex` and `Err`. Sent at all four permanent-failure return points in `executeSingle` (planning exhausted, running exhausted, verifying exhausted, post-loop safety net).
+- The TUI stores `failureReport`, `failedCmdIndex`, `showExpandedLog`, and `failureScrollOff` on `Model`. The failure panel (`viewFailurePanel()`) shows command info + scrollable last-attempt stderr (compact) or full report (expanded via `l` key). Scroll is separate from the main output scroll (`failureScrollOff` vs `scrollOffset`).
+
 ### Execution flow
 
 Each command goes through: Pending -> Planning -> Running -> Verifying -> Documenting -> Committing -> Success. On failure, it retries from Planning with a fresh plan up to `max_retries` times (where `max_retries` is the total attempt count, not additional retries).

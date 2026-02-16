@@ -129,6 +129,10 @@ type Model struct {
 	resumeSession  *session.SessionState // detected previous session (nil if none)
 	resumeIndex    int                   // index where execution would resume from
 	autoResume     bool                  // auto-resume without TUI prompt (--auto-run)
+	failureReport    string // Full failure report text from runner
+	failedCmdIndex   int    // Index of the failed command (-1 if none)
+	showExpandedLog  bool   // 'l' toggle: show all attempts' full stdout/stderr
+	failureScrollOff int    // Scroll offset for failure panel viewport
 }
 
 // NewModel creates a new TUI model wired to the given runner.
@@ -150,14 +154,15 @@ func NewModel(r *runner.Runner) Model {
 	s.Style = statusRunning
 
 	return Model{
-		state:       StateInput,
-		commands:    make([]*types.Command, 0),
-		runner:      r,
-		textInput:   ta,
-		verifyInput: ti,
-		inputMode:   "prompt",
-		spinner:     s,
-		currentCmd:  -1,
+		state:          StateInput,
+		commands:       make([]*types.Command, 0),
+		runner:         r,
+		textInput:      ta,
+		verifyInput:    ti,
+		inputMode:      "prompt",
+		spinner:        s,
+		currentCmd:     -1,
+		failedCmdIndex: -1,
 	}
 }
 
@@ -378,6 +383,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case runner.ExecutionErrorMsg:
 		m.err = msg.Err
+		m.failureReport = msg.FailureReport
+		m.failedCmdIndex = msg.CmdIndex
+		m.failureScrollOff = 0
+		m.showExpandedLog = false
 		return m, nil
 	}
 
@@ -580,15 +589,31 @@ func (m Model) handleRunningKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "ctrl+c":
 		m.runner.Cancel()
 		return m, tea.Quit
+	case "l":
+		if m.done && m.failedCmdIndex >= 0 {
+			m.showExpandedLog = !m.showExpandedLog
+			m.failureScrollOff = 0
+		}
+		return m, nil
 	case "up", "k":
-		if m.scrollOffset > 0 {
-			m.scrollOffset--
+		if m.done && m.failedCmdIndex >= 0 {
+			if m.failureScrollOff > 0 {
+				m.failureScrollOff--
+			}
+		} else {
+			if m.scrollOffset > 0 {
+				m.scrollOffset--
+			}
 		}
 		return m, nil
 	case "down", "j":
-		max := m.maxScrollOffset()
-		if m.scrollOffset < max {
-			m.scrollOffset++
+		if m.done && m.failedCmdIndex >= 0 {
+			m.failureScrollOff++
+		} else {
+			max := m.maxScrollOffset()
+			if m.scrollOffset < max {
+				m.scrollOffset++
+			}
 		}
 		return m, nil
 	}
@@ -615,6 +640,126 @@ func (m Model) maxScrollOffset() int {
 		return 0
 	}
 	return max
+}
+
+func (m Model) failureViewportHeight() int {
+	// title(2) + summary header(4) + command list + failure panel chrome(8) + help bar(2)
+	reserved := 2 + 4 + len(m.commands) + 8 + 2
+	h := m.height - reserved
+	if h < 3 {
+		h = 3
+	}
+	return h
+}
+
+func (m Model) viewFailurePanel() string {
+	var b strings.Builder
+
+	if m.failedCmdIndex < 0 || m.failedCmdIndex >= len(m.commands) {
+		return ""
+	}
+
+	cmd := m.commands[m.failedCmdIndex]
+
+	// Section header
+	b.WriteString(statusFailed.Render("═══ FAILURE DETAILS ═══"))
+	b.WriteString("\n\n")
+
+	// Info fields
+	prompt := truncate(cmd.Prompt, 80)
+	b.WriteString(fmt.Sprintf("  Command #%d:  %q\n", m.failedCmdIndex+1, prompt))
+	b.WriteString(fmt.Sprintf("  Attempts:    %d / %d\n", cmd.Attempts, cmd.MaxRetries))
+
+	if len(cmd.AttemptLogs) > 0 {
+		lastAttempt := cmd.AttemptLogs[len(cmd.AttemptLogs)-1]
+		failedStep := lastAttempt.FailedStep
+		if failedStep == "" {
+			failedStep = "(unknown)"
+		}
+		b.WriteString(fmt.Sprintf("  Last failed: %s\n", failedStep))
+		b.WriteString(fmt.Sprintf("  Exit code:   %d\n", lastAttempt.ExitCode))
+	} else {
+		b.WriteString("  No attempt data available\n")
+	}
+
+	b.WriteString("\n")
+
+	// Scrollable content area
+	vpHeight := m.failureViewportHeight()
+	var contentLines []string
+
+	if m.showExpandedLog {
+		// Expanded: full failure report
+		b.WriteString(statusFailed.Render("─── Full failure report ───"))
+		b.WriteString("\n")
+		if m.failureReport != "" {
+			contentLines = strings.Split(m.failureReport, "\n")
+		} else {
+			contentLines = []string{"(no report available)"}
+		}
+	} else {
+		// Compact: last attempt stderr
+		b.WriteString(statusFailed.Render("─── Last attempt stderr ───"))
+		b.WriteString("\n")
+		if len(cmd.AttemptLogs) > 0 {
+			lastAttempt := cmd.AttemptLogs[len(cmd.AttemptLogs)-1]
+			if lastAttempt.Stderr != "" {
+				contentLines = strings.Split(lastAttempt.Stderr, "\n")
+			} else {
+				contentLines = []string{"(no stderr captured)"}
+			}
+		} else {
+			contentLines = []string{"(no attempt data available)"}
+		}
+	}
+
+	// Cap scroll offset
+	maxOff := len(contentLines) - vpHeight
+	if maxOff < 0 {
+		maxOff = 0
+	}
+	scrollOff := m.failureScrollOff
+	if scrollOff > maxOff {
+		scrollOff = maxOff
+	}
+
+	// Top scroll indicator
+	if scrollOff > 0 {
+		b.WriteString(helpStyle.Render(fmt.Sprintf("  --- %d lines above ---", scrollOff)))
+		b.WriteString("\n")
+	}
+
+	// Visible lines
+	end := scrollOff + vpHeight
+	if end > len(contentLines) {
+		end = len(contentLines)
+	}
+
+	maxWidth := m.width - 4
+	if maxWidth < 40 {
+		maxWidth = 40
+	}
+
+	for i := scrollOff; i < end; i++ {
+		line := contentLines[i]
+		if len(line) > maxWidth {
+			line = line[:maxWidth]
+		}
+		b.WriteString(outputStyle.Render("  " + line))
+		b.WriteString("\n")
+	}
+
+	// Bottom scroll indicator
+	remaining := len(contentLines) - end
+	if remaining > 0 {
+		b.WriteString(helpStyle.Render(fmt.Sprintf("  --- %d lines below ---", remaining)))
+		b.WriteString("\n")
+	}
+
+	b.WriteString("\n")
+	b.WriteString(helpStyle.Render("Full report written to autoclaude-error.log"))
+
+	return b.String()
 }
 
 func (m Model) viewName() string {
@@ -1044,13 +1189,20 @@ func (m Model) viewRunningDone() string {
 		b.WriteString(fmt.Sprintf("  %s %d. %s  %s\n", icon, i+1, prompt, status))
 	}
 
-	// Error
-	if m.err != nil {
+	// Failure panel or generic error
+	if m.failedCmdIndex >= 0 {
+		b.WriteString("\n")
+		b.WriteString(m.viewFailurePanel())
+	} else if m.err != nil {
 		b.WriteString(fmt.Sprintf("\n%s\n", statusFailed.Render(fmt.Sprintf("Error: %v", m.err))))
 	}
 
 	b.WriteString("\n")
-	b.WriteString(helpStyle.Render("q: quit"))
+	if m.failedCmdIndex >= 0 {
+		b.WriteString(helpStyle.Render("l: toggle full log  |  up/down: scroll  |  q: quit"))
+	} else {
+		b.WriteString(helpStyle.Render("q: quit"))
+	}
 
 	return b.String()
 }

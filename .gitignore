@@ -33,6 +33,9 @@ go.work.sum
 # Session state
 .autoclaude-session.json
 
+# Error logs
+autoclaude-error.log
+
 # Editor/IDE
 .idea/
 .vscode/

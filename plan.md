@@ -1,335 +1,331 @@
-# Plan: Audit and Fix Retry Mechanism
+# Implementation Plan: Failure Report Output
 
-## Current State Analysis
+## Overview
 
-### What's already correct
-- **Loop arithmetic**: `for cmd.Attempts < cmd.MaxRetries { cmd.Attempts++; ... }` with MaxRetries=3 yields exactly 3 total attempts. No off-by-one.
-- **Verification retries full cycle**: On verify failure, `cmd.PlanOutput = ""` forces fresh planning on next iteration. Correct.
-- **Doc/commit are non-fatal**: Both are outside the retry loop and use `updateLastAttempt`. Correct.
-
-### Bugs to fix
-1. **No sleep between retries** — `continue` fires immediately after `StatusRetrying`
-2. **No retry separator in `cmd.Output`** — user sees no visual boundary between attempts
-3. **No "Attempt N/M" in TUI** — spinner just shows "Planning", "Running", etc. with no attempt counter
-4. **Planning failure doesn't preserve output** — on planning failure in the retry branch (line 206), `cmd.Output` is not set before `sendUpdate`, so the TUI receives `planOutput` as the `Output` field of the message but `cmd.Output` itself is stale
-5. **Planning failure doesn't clear `PlanOutput`** — technically harmless (it's already empty), but inconsistent with exec/verify which explicitly clear it
-6. **Dead code at lines 282-287** — the post-loop `!success` block is unreachable in practice but should be kept as a safety net
+Add failure report file logging and an enhanced TUI failure panel when commands permanently fail (exhaust retries). Three areas of change: runner (file writing + enriched error message), TUI (failure panel with expandable attempt detail), and project metadata (.gitignore, README).
 
 ---
 
-## File Changes
+## 1. `internal/runner/runner.go` — Write failure report to file and enrich error message
 
-### File 1: `internal/runner/runner.go`
+### 1a. Add `"os"` and `"path/filepath"` imports
 
-#### Change 1.1: Add `StatusDetail` field to `StatusUpdateMsg`
+Add to the import block (lines 3–17). Both are needed for file operations.
 
-**Lines 20-24.** Add a field for the attempt counter string.
+### 1b. Add `writeFailureReport` helper method
+
+New private method on `*Runner`:
 
 ```go
-// Before:
-type StatusUpdateMsg struct {
-    CmdIndex int
-    Status   types.CommandStatus
-    Output   string
-}
-
-// After:
-type StatusUpdateMsg struct {
-    CmdIndex     int
-    Status       types.CommandStatus
-    Output       string
-    StatusDetail string // e.g. "Attempt 2/3"
-}
+func (r *Runner) writeFailureReport(cmd *types.Command) string
 ```
 
-#### Change 1.2: Update `sendUpdate` signature
+**Behavior:**
+1. Build a header block:
+   ```
+   ════════════════════════════════════════
+   FAILURE REPORT — 2026-02-16T14:30:05Z
+   Command: "first 100 chars of prompt..."
+   ════════════════════════════════════════
+   ```
+   - Timestamp: `time.Now().Format(time.RFC3339)`
+   - Prompt: truncated to 100 characters — if longer, append `"..."`
+2. Call `cmd.FormatFailureReport()` to get the body
+3. Combine: `header + "\n" + body + "\n\n"` into `fullReport`
+4. Open file `filepath.Join(r.WorkDir, "autoclaude-error.log")` with `os.OpenFile(..., os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)`
+5. Write `fullReport` to the file, close it
+6. If file write fails: append a warning line to `cmd.Output` (e.g. `"[warn] failed to write error log: <err>"`). Do NOT alter the failure flow. Same pattern as `captureGitContext` and `saveSession`.
+7. Return `fullReport` (caller uses it for the TUI error message)
 
-**Lines 331-339.** Add `detail string` parameter, populate `StatusDetail` in the message.
+### 1c. Enrich `ExecutionErrorMsg` with failure report data
 
-```go
-// Before:
-func (r *Runner) sendUpdate(index int, status types.CommandStatus, output string)
-
-// After:
-func (r *Runner) sendUpdate(index int, status types.CommandStatus, output string, detail string)
-```
-
-Body: set `StatusDetail: detail` in the `StatusUpdateMsg` literal.
-
-#### Change 1.3: Update ALL existing `sendUpdate` call sites
-
-Every call to `sendUpdate` must get the new 4th argument. Here is every call site in the function and what to pass:
-
-**Inside the retry loop** (where `cmd.Attempts` is known):
-- Line 194 (planning start): pass `detail` (defined as `fmt.Sprintf("Attempt %d/%d", cmd.Attempts, cmd.MaxRetries)`)
-- Line 206 (planning fail, retry): pass `detail`
-- Line 212 (planning fail, max reached): pass `""`
-- Line 223 (execution start): pass `detail`
-- Line 239 (execution fail, retry): pass `detail`
-- Line 243 (execution fail, max reached): pass `""`
-- Line 251 (verify start): pass `detail`
-- Line 266 (verify fail, retry): pass `detail`
-- Line 270 (verify fail, max reached): pass `""`
-
-**Post-loop:**
-- Line 284 (safety-net fail): pass `""`
-- Line 292 (documenting start): pass `detail` (recomputed after loop as `fmt.Sprintf(...)`)
-- Line 306 (documenting output update): pass `detail`
-- Line 311 (committing start): pass `detail`
-- Line 326 (final success): pass `""`
-
-#### Change 1.4: Define `detail` variable at top of each iteration
-
-Immediately after `cmd.Attempts++` (line 175), add:
+Modify `ExecutionErrorMsg` struct (lines 31–34) to add a `FailureReport` field:
 
 ```go
-detail := fmt.Sprintf("Attempt %d/%d", cmd.Attempts, cmd.MaxRetries)
-```
-
-And after the retry loop (before doc/commit steps), redefine for post-loop use:
-
-```go
-detail := fmt.Sprintf("Attempt %d/%d", cmd.Attempts, cmd.MaxRetries)
-```
-
-#### Change 1.5: Add 2-second sleep with context cancellation on retry
-
-At each of the three retry points (planning fail + retry, execution fail + retry, verification fail + retry), insert **after** `r.saveSession()` and **before** `continue`:
-
-```go
-select {
-case <-time.After(2 * time.Second):
-case <-r.ctx.Done():
-    cmd.Status = types.StatusFailed
-    r.sendUpdate(i, types.StatusFailed, cmd.Output, "")
-    r.saveSession()
-    return false
+type ExecutionErrorMsg struct {
+    CmdIndex      int
+    Err           error
+    FailureReport string  // NEW: full formatted failure report
 }
 ```
 
-Using `select` instead of `time.Sleep` ensures the runner responds promptly to cancellation (e.g., user presses Ctrl+C). Without this, a cancelled runner would block for up to 2 seconds per retry point.
+### 1d. Call `writeFailureReport` and send enriched error at permanent failure points
 
-**Three locations to add this:**
-1. Planning failure retry path (after line 208, before `continue`)
-2. Execution failure retry path (after line 240, before `continue`)
-3. Verification failure retry path (after line 268, before `continue`)
+There are **four** places where `executeSingle` sets `StatusFailed` and returns false:
 
-#### Change 1.6: Append retry separator to `cmd.Output` on retry
+1. **Planning failure, retries exhausted** (~line 228): `cmd.Status = types.StatusFailed` then `return false`
+2. **Running failure, retries exhausted** (~line 260): same pattern
+3. **Verifying failure, retries exhausted** (~line 291): same pattern
+4. **Post-loop `!success` guard** (~line 304): safety net, same pattern
 
-At each retry point, **before** the `StatusRetrying` sendUpdate, append a separator:
+At each of these four points, **after** `r.sendUpdate(...)` and `r.saveSession()` but **before** `return false`, insert:
 
 ```go
-cmd.Output += fmt.Sprintf("\n═══ RETRY %d/%d ═══ (previous attempt failed at: %s, exit code: %d)\n",
-    cmd.Attempts+1, cmd.MaxRetries, "<StepName>", result.ExitCode)
+report := r.writeFailureReport(cmd)
+if r.program != nil {
+    r.program.Send(ExecutionErrorMsg{
+        CmdIndex:      i,
+        Err:           fmt.Errorf("command failed after %d attempt(s)", cmd.Attempts),
+        FailureReport: report,
+    })
+}
 ```
 
-Where `<StepName>` is "Planning", "Running", or "Verifying" depending on the failure point, and `result` is `planResult`, `execResult`, or `verifyResult` respectively. `cmd.Attempts+1` is the upcoming attempt number (since `cmd.Attempts` is the just-finished attempt).
-
-**Three locations:**
-1. Planning failure retry: `"Planning"`, `planResult.ExitCode`
-2. Execution failure retry: `"Running"`, `execResult.ExitCode`
-3. Verification failure retry: `"Verifying"`, `verifyResult.ExitCode`
-
-#### Change 1.7: Fix `cmd.Output` on planning failure
-
-**Current behavior (line 206):** On planning failure with retries remaining, `r.sendUpdate(i, types.StatusRetrying, planOutput)` sends `planOutput` as the output. But `cmd.Output` is never set, so it's stale (empty or from a prior attempt).
-
-**Fix:** Before appending the retry separator, set:
-```go
-cmd.Output += planOutput
-```
-
-This ensures the separator is appended to the actual output, and `cmd.Output` reflects reality.
-
-Also do the same on the max-retries-exceeded path (line 211 currently does `cmd.Output = planOutput` which is correct but should be `cmd.Output += planOutput` for consistency with multi-attempt accumulation).
-
-**Wait, reconsider:** On the first attempt, `cmd.Output` is `""`. Using `+=` is fine. On subsequent attempts, `cmd.Output` already has the retry separator and previous output. Using `+=` correctly accumulates. But line 211 currently uses `=` (assignment), which would **overwrite** prior output. Change line 211 from `cmd.Output = planOutput` to `cmd.Output += planOutput` as well.
-
-#### Change 1.8: Adjust execution step `cmd.Output` assignment
-
-**Line 222:** Currently:
-```go
-cmd.Output = "═══ PLAN ═══\n" + cmd.PlanOutput + "\n═══ EXECUTION ═══\n"
-```
-
-This **overwrites** `cmd.Output`, discarding any prior retry separator and accumulated output. On the first attempt this is fine, but on retry attempts the retry separator was just appended.
-
-**Fix:** Change to:
-```go
-cmd.Output += "═══ PLAN ═══\n" + cmd.PlanOutput + "\n═══ EXECUTION ═══\n"
-```
-
-This preserves the retry separator and any prior output.
-
-#### Change 1.9: Ensure `PlanOutput` is cleared on planning failure retry
-
-**Planning failure retry path:** Add `cmd.PlanOutput = ""` for consistency (it's already empty since we only enter planning when `cmd.PlanOutput == ""`, but be explicit).
+Only one of these four paths executes per call, so no duplication risk.
 
 ---
 
-### File 2: `internal/tui/model.go`
+## 2. `internal/tui/model.go` — Failure panel with expandable attempt details
 
-#### Change 2.1: Add `statusDetail` field to `Model` struct
-
-**Around line 120** (in the struct definition), add:
+### 2a. Add new fields to `Model` struct (lines 108–132)
 
 ```go
-statusDetail string // transient "Attempt N/M" text from runner
+failureReport    string  // Full failure report text from runner
+failedCmdIndex   int     // Index of the failed command (-1 if none)
+showExpandedLog  bool    // 'l' toggle: show all attempts' full stdout/stderr
+failureScrollOff int     // Scroll offset for failure panel viewport
 ```
 
-#### Change 2.2: Store `StatusDetail` in `StatusUpdateMsg` handler
+Initialize `failedCmdIndex` to `-1` in `NewModel()` (line 135).
 
-**Lines 344-371** (`case runner.StatusUpdateMsg:` in `Update()`).
+### 2b. Handle enriched `ExecutionErrorMsg` in `Update()` (lines 379–381)
 
-After `m.commands[msg.CmdIndex].Output = msg.Output` (line 347), add:
+Currently:
+```go
+case runner.ExecutionErrorMsg:
+    m.err = msg.Err
+    return m, nil
+```
+
+Change to:
+```go
+case runner.ExecutionErrorMsg:
+    m.err = msg.Err
+    m.failureReport = msg.FailureReport
+    m.failedCmdIndex = msg.CmdIndex
+    m.failureScrollOff = 0
+    m.showExpandedLog = false
+    return m, nil
+```
+
+### 2c. Add `'l'` keybinding in `handleRunningKey()` (lines 571–597)
+
+Add a new case in the switch at line 574:
 
 ```go
-if msg.CmdIndex == m.currentCmd {
-    m.statusDetail = msg.StatusDetail
+case "l":
+    if m.done && m.failedCmdIndex >= 0 {
+        m.showExpandedLog = !m.showExpandedLog
+        m.failureScrollOff = 0  // reset scroll on toggle
+    }
+    return m, nil
+```
+
+### 2d. Modify up/down/j/k scroll in `handleRunningKey()` for done+failure state
+
+Currently (lines 583–593) up/down always scroll `m.scrollOffset`. When `m.done && m.failedCmdIndex >= 0`, they should scroll `m.failureScrollOff` instead (the failure panel viewport).
+
+Change the existing cases:
+
+```go
+case "up", "k":
+    if m.done && m.failedCmdIndex >= 0 {
+        if m.failureScrollOff > 0 {
+            m.failureScrollOff--
+        }
+    } else {
+        if m.scrollOffset > 0 {
+            m.scrollOffset--
+        }
+    }
+    return m, nil
+case "down", "j":
+    if m.done && m.failedCmdIndex >= 0 {
+        // Cap will happen during rendering
+        m.failureScrollOff++
+    } else {
+        max := m.maxScrollOffset()
+        if m.scrollOffset < max {
+            m.scrollOffset++
+        }
+    }
+    return m, nil
+```
+
+### 2e. Add `failureViewportHeight()` helper
+
+New method:
+
+```go
+func (m Model) failureViewportHeight() int
+```
+
+Calculate available height for the scrollable portion of the failure panel:
+- Total terminal height minus: title (2 lines) + summary header (4 lines) + command list (`len(m.commands)` lines) + failure panel chrome (~8 lines: section header, info fields, separator, footer note, blank lines) + help bar (2 lines)
+- Minimum 3 lines
+- Used to cap `m.failureScrollOff` and determine visible line count
+
+### 2f. Add `viewFailurePanel()` method
+
+New method:
+
+```go
+func (m Model) viewFailurePanel() string
+```
+
+**Compact view** (default, `showExpandedLog == false`):
+
+```
+═══ FAILURE DETAILS ═══
+
+  Command #3:  "Add error handling to the API endpoi..."
+  Attempts:    3 / 3
+  Last failed: Verifying
+  Exit code:   1
+
+─── Last attempt stderr ───
+<scrollable viewport of last attempt's Stderr>
+
+Full report written to autoclaude-error.log
+```
+
+Populated from:
+- `cmd := m.commands[m.failedCmdIndex]`
+- `lastAttempt := cmd.AttemptLogs[len(cmd.AttemptLogs)-1]`
+- Command number: `m.failedCmdIndex + 1` (1-based display)
+- Prompt: `truncate(cmd.Prompt, 80)` (existing helper)
+- Attempts: `cmd.Attempts` / `cmd.MaxRetries`
+- Last failed step: `lastAttempt.FailedStep`
+- Exit code: `lastAttempt.ExitCode`
+- Stderr content: split `lastAttempt.Stderr` into lines, render scrollable viewport using `m.failureScrollOff` and `m.failureViewportHeight()`
+
+**Expanded view** (`showExpandedLog == true`):
+
+Replace the "Last attempt stderr" section with the full `m.failureReport` (header + all attempts with stdout/stderr). Split into lines, render scrollable using same `m.failureScrollOff` / `m.failureViewportHeight()`.
+
+Keep the same info block and footer.
+
+**Edge cases:**
+- If `cmd.AttemptLogs` is empty: show "No attempt data available" instead of indexing into empty slice
+- If `lastAttempt.Stderr` is empty: show `(no stderr captured)`
+- Cap `m.failureScrollOff` to `max(0, totalLines - viewportHeight)` during rendering (prevents over-scroll)
+- Style the section headers with the existing `statusFailed` lipgloss style (red)
+
+### 2g. Integrate `viewFailurePanel()` into `viewRunningDone()` (lines 1009–1056)
+
+After the per-command results loop (line 1045), before the existing error display (line 1048), insert:
+
+```go
+if m.failedCmdIndex >= 0 {
+    b.WriteString("\n")
+    b.WriteString(m.viewFailurePanel())
 }
 ```
 
-Also, inside the block where `m.currentCmd` changes (line 352-356):
+Remove or conditionalize the existing `m.err` display (lines 1048–1050) since the failure panel now shows richer information. If `m.failedCmdIndex >= 0`, the panel handles error display. Otherwise, keep the `m.err` fallback for unexpected errors.
 
+### 2h. Update help bar in `viewRunningDone()` (line 1053)
+
+Change from:
 ```go
-if ... && msg.CmdIndex != m.currentCmd {
-    m.currentCmd = msg.CmdIndex
-    m.statusDetail = msg.StatusDetail  // carry detail to new command
-    m.scrollOffset = 0
-    m.outputLines = nil
+b.WriteString(helpStyle.Render("q: quit"))
+```
+
+To:
+```go
+if m.failedCmdIndex >= 0 {
+    b.WriteString(helpStyle.Render("l: toggle full log  |  up/down: scroll  |  q: quit"))
+} else {
+    b.WriteString(helpStyle.Render("q: quit"))
 }
 ```
 
-And clear it on terminal statuses (success/failed) so it doesn't linger:
+---
 
-```go
-if msg.Status == types.StatusSuccess || msg.Status == types.StatusFailed {
-    m.statusDetail = ""
-    // ... existing output reconciliation ...
-}
+## 3. `.gitignore` — Add error log entry
+
+After the session state entry (line 34), add:
+
+```
+# Error logs
+autoclaude-error.log
 ```
 
-#### Change 2.3: Display `statusDetail` next to spinner in `viewRunning()`
+---
 
-**Lines 974-977.** After the status text, conditionally append the detail:
+## 4. `README.md` — Document failure logging and new keybinding
 
-```go
-// Current:
-b.WriteString(m.spinner.View())
-b.WriteString(" ")
-b.WriteString(styledStatus(cmd.Status))
-b.WriteString("\n\n")
+### 4a. Add "Failure logging" section
 
-// New:
-b.WriteString(m.spinner.View())
-b.WriteString(" ")
-b.WriteString(styledStatus(cmd.Status))
-if m.statusDetail != "" {
-    b.WriteString("  ")
-    b.WriteString(lipgloss.NewStyle().Faint(true).Render(m.statusDetail))
-}
-b.WriteString("\n\n")
+Insert a new section **before** the "Keybindings" section (before line 323 `## Keybindings`):
+
+```markdown
+## Failure logging
+
+When a command permanently fails (all retry attempts exhausted), autoclaude writes a detailed failure report to `autoclaude-error.log` in the working directory. The file is append-only — each failure adds a timestamped entry, so logs accumulate across runs.
+
+Each entry includes:
+- Timestamp and command prompt
+- Per-attempt details: failed step, exit code, duration, stdout/stderr
+- Git context (branch, status) at the time of each attempt
+
+The log file is included in `.gitignore` by default.
+
+When execution finishes with failures, the TUI shows a failure panel with:
+- Command number, prompt, attempt count, last failed step, and exit code
+- Scrollable last-attempt stderr
+- Press `l` to expand the full failure report showing all attempts with stdout/stderr
+
+This file is useful for debugging failures in `--auto-run` mode where the TUI is non-interactive.
 ```
 
-Result: `⠋ Planning  Attempt 2/3` where "Attempt 2/3" is dimmed.
+### 4b. Update Running view keybindings table (lines 361–368)
+
+Add the `l` keybinding row to the Running view table:
+
+```markdown
+### Running view
+
+| Key | Action |
+|-----|--------|
+| `j` / `Down` | Scroll output down |
+| `k` / `Up` | Scroll output up |
+| `l` | Toggle expanded failure log (after execution) |
+| `q` | Quit (after execution completes) |
+| `Ctrl+C` | Force quit |
+```
 
 ---
 
-## No changes needed
+## 5. Edge Cases and Considerations
 
-- **`internal/types/types.go`** — No changes. `Command`, `AttemptLog`, `CommandStatus`, session types all sufficient.
-- **`internal/config/config.go`** — No changes. MaxRetries parsing is correct.
-- **`main.go`** — No changes. Flag handling and config precedence are correct.
+1. **File write permission errors**: `writeFailureReport` handles `os.OpenFile` errors gracefully — appends a warning to `cmd.Output` but doesn't alter the failure flow or panic.
 
----
+2. **Empty AttemptLogs**: Defensive check in `viewFailurePanel()` — if `cmd.AttemptLogs` has length 0, show "No attempt data available" instead of panicking on slice access.
 
-## Complete Trace: Retry Flow with MaxRetries=3
+3. **Very long stderr / report**: The scrollable viewport in the failure panel handles arbitrary length. Scroll offset is capped during rendering.
 
-### Attempt 1 (first run)
-1. `cmd.Attempts` = 0. Loop: `0 < 3` → true. `cmd.Attempts++` → 1.
-2. `detail = "Attempt 1/3"`
-3. Planning: `sendUpdate(StatusPlanning, "", "Attempt 1/3")`
-4. Planning succeeds → `cmd.PlanOutput` set
-5. Execution: `sendUpdate(StatusRunning, ..., "Attempt 1/3")`
-6. Execution succeeds
-7. Verification: `sendUpdate(StatusVerifying, ..., "Attempt 1/3")`
-8. **Verification fails** (exit code 1)
-9. `cmd.PlanOutput = ""`
-10. `finalizeAttempt(attemptLog, "Verifying", 1)`
-11. `cmd.Attempts` (1) `< cmd.MaxRetries` (3) → true → will retry
-12. Append separator: `"\n═══ RETRY 2/3 ═══ (previous attempt failed at: Verifying, exit code: 1)\n"`
-13. `sendUpdate(StatusRetrying, cmd.Output, "Attempt 1/3")`
-14. `saveSession()`
-15. Sleep 2 seconds (with ctx cancellation check)
-16. `continue`
+4. **Multiple failed commands**: Currently execution halts on first permanent failure (`executeAll` returns when `executeSingle` returns false). So there will only ever be one `failedCmdIndex`. If this changes in the future, the field stores the most recently failed command.
 
-### Attempt 2 (retry)
-1. `cmd.Attempts` = 1. Loop: `1 < 3` → true. `cmd.Attempts++` → 2.
-2. `detail = "Attempt 2/3"`
-3. `cmd.PlanOutput` is "" → Planning runs again: `sendUpdate(StatusPlanning, ..., "Attempt 2/3")`
-4. Planning succeeds
-5. `cmd.Output += "═══ PLAN ═══\n..."` (appends to existing output with separator)
-6. Execution: `sendUpdate(StatusRunning, ..., "Attempt 2/3")`
-7. **Execution fails** (exit code 2)
-8. `cmd.PlanOutput = ""`
-9. `finalizeAttempt(attemptLog, "Running", 2)`
-10. `cmd.Attempts` (2) `< cmd.MaxRetries` (3) → true → will retry
-11. Append separator: `"\n═══ RETRY 3/3 ═══ (previous attempt failed at: Running, exit code: 2)\n"`
-12. `sendUpdate(StatusRetrying, cmd.Output, "Attempt 2/3")`
-13. Sleep 2 seconds
-14. `continue`
+5. **Concurrent file access**: Not an issue — only one runner writes to the log file, and it opens/writes/closes synchronously.
 
-### Attempt 3 (final attempt)
-1. `cmd.Attempts` = 2. Loop: `2 < 3` → true. `cmd.Attempts++` → 3.
-2. `detail = "Attempt 3/3"`
-3. Planning: `sendUpdate(StatusPlanning, ..., "Attempt 3/3")`
-4. **Planning fails** (exit code 1)
-5. `finalizeAttempt(attemptLog, "Planning", 1)`
-6. `cmd.Attempts` (3) `< cmd.MaxRetries` (3) → **false** → max reached
-7. `cmd.Status = StatusFailed`
-8. `sendUpdate(StatusFailed, cmd.Output, "")`
-9. `return false`
+6. **Auto-run mode**: The failure report file is especially useful here since the TUI is non-interactive. The file persists after exit.
 
-### MaxRetries=1 (no retries)
-1. `cmd.Attempts` = 0. Loop: `0 < 1` → true. `cmd.Attempts++` → 1.
-2. If any step fails: `cmd.Attempts` (1) `< cmd.MaxRetries` (1) → false → `StatusFailed`, `return false`
-3. Retry separator is never appended. Sleep never happens. Correct.
+7. **`failureScrollOff` vs `scrollOffset`**: Separate fields. During live execution, up/down scrolls `scrollOffset` (output viewport). In done state with failure, up/down scrolls `failureScrollOff` (failure panel). No confusion.
 
-### Success on first attempt
-1. `cmd.Attempts` = 0 → 1.
-2. Planning, execution, verification all pass.
-3. `finalizeAttempt(attemptLog, "", 0)`, `success = true`, `break`.
-4. Doc step: `sendUpdate(StatusDocumenting, ..., "Attempt 1/3")`
-5. Commit step: `sendUpdate(StatusCommitting, ..., "Attempt 1/3")`
-6. Final: `sendUpdate(StatusSuccess, ..., "")`
+8. **Toggle reset**: When pressing `l` to toggle between compact/expanded view, `failureScrollOff` resets to 0 so the user starts at the top of whichever view they switched to.
+
+9. **No-failure case**: When all commands succeed, `failedCmdIndex` stays at `-1`. The failure panel is never rendered. The help bar shows just "q: quit". No behavioral change for the happy path.
 
 ---
 
-## Edge Cases
+## Files Modified
 
-1. **MaxRetries=0**: Loop never enters. `success` stays false. Post-loop safety net sets `StatusFailed`. Config code prevents this (defaults 0→3), but safety net handles it.
+| File | Change Summary |
+|------|----------------|
+| `internal/runner/runner.go` | Add `os`, `path/filepath` imports; add `writeFailureReport()` method; add `FailureReport` field to `ExecutionErrorMsg`; send enriched error message at all 4 permanent-failure return points |
+| `internal/tui/model.go` | Add `failureReport`, `failedCmdIndex`, `showExpandedLog`, `failureScrollOff` fields to `Model`; handle enriched `ExecutionErrorMsg`; add `l` keybinding; modify up/down to scroll failure panel when done; add `viewFailurePanel()` and `failureViewportHeight()` methods; integrate panel into `viewRunningDone()`; update help bar |
+| `.gitignore` | Add `autoclaude-error.log` entry |
+| `README.md` | Add "Failure logging" section before Keybindings; add `l` keybinding to Running view table |
 
-2. **Context cancelled during 2s sleep**: The `select` on `r.ctx.Done()` fires immediately, sets `StatusFailed`, returns false. Runner stops cleanly within milliseconds.
-
-3. **Resumed session with existing `cmd.Output`**: The `+=` operators for `cmd.Output` correctly accumulate. The retry separator will appear after whatever output existed from the session.
-
-4. **Resumed session resets `Attempts=0`** (model.go line 274): Gives a fresh retry budget. The loop starts from scratch. Correct existing behavior, no change needed.
-
-5. **Doc failure followed by commit success**: `updateLastAttempt("Documenting", docExitCode)` sets FailedStep. Then `updateLastAttempt("", 0)` for commit success doesn't overwrite FailedStep (due to the `if failedStep != ""` guard). The AttemptLog correctly records "Documenting" as the failed step even though the command overall succeeds. No change needed.
-
----
-
-## Verification After Implementation
-
-1. `go build -o autoclaude .` — must compile
-2. `go test ./...` — must pass
-3. Manual test with `max_retries = 2` and a failing verify command:
-   - Spinner shows "Planning  Attempt 1/2", "Running  Attempt 1/2", "Verifying  Attempt 1/2"
-   - Output shows `═══ RETRY 2/2 ═══ (previous attempt failed at: Verifying, exit code: 1)`
-   - 2-second pause before retry
-   - Fresh planning on attempt 2
-   - If attempt 2 also fails: "Failed" with no "Attempt N/M"
-4. Manual test with `max_retries = 1`:
-   - No retry separator, no sleep, single attempt
-5. Manual test with doc/commit failure:
-   - Warning logged, no retry triggered, command still succeeds
+**No new files created.**

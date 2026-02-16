@@ -6,7 +6,9 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -29,8 +31,9 @@ type AllDoneMsg struct{}
 
 // ExecutionErrorMsg is sent when a command encounters an unrecoverable error.
 type ExecutionErrorMsg struct {
-	CmdIndex int
-	Err      error
+	CmdIndex      int
+	Err           error
+	FailureReport string
 }
 
 // OutputLineMsg is sent to the TUI for each line of output from a running command.
@@ -221,6 +224,14 @@ func (r *Runner) executeSingle(i int, cmd *types.Command) bool {
 				cmd.Output += planOutput
 				r.sendUpdate(i, types.StatusFailed, cmd.Output, "")
 				r.saveSession()
+				report := r.writeFailureReport(cmd)
+				if r.program != nil {
+					r.program.Send(ExecutionErrorMsg{
+						CmdIndex:      i,
+						Err:           fmt.Errorf("command failed after %d attempt(s)", cmd.Attempts),
+						FailureReport: report,
+					})
+				}
 				return false
 			}
 			cmd.PlanOutput = planOutput
@@ -258,6 +269,14 @@ func (r *Runner) executeSingle(i int, cmd *types.Command) bool {
 			cmd.Status = types.StatusFailed
 			r.sendUpdate(i, types.StatusFailed, cmd.Output, "")
 			r.saveSession()
+			report := r.writeFailureReport(cmd)
+			if r.program != nil {
+				r.program.Send(ExecutionErrorMsg{
+					CmdIndex:      i,
+					Err:           fmt.Errorf("command failed after %d attempt(s)", cmd.Attempts),
+					FailureReport: report,
+				})
+			}
 			return false
 		}
 
@@ -291,6 +310,14 @@ func (r *Runner) executeSingle(i int, cmd *types.Command) bool {
 				cmd.Status = types.StatusFailed
 				r.sendUpdate(i, types.StatusFailed, cmd.Output, "")
 				r.saveSession()
+				report := r.writeFailureReport(cmd)
+				if r.program != nil {
+					r.program.Send(ExecutionErrorMsg{
+						CmdIndex:      i,
+						Err:           fmt.Errorf("command failed after %d attempt(s)", cmd.Attempts),
+						FailureReport: report,
+					})
+				}
 				return false
 			}
 		}
@@ -305,6 +332,14 @@ func (r *Runner) executeSingle(i int, cmd *types.Command) bool {
 		cmd.Status = types.StatusFailed
 		r.sendUpdate(i, types.StatusFailed, cmd.Output, "")
 		r.saveSession()
+		report := r.writeFailureReport(cmd)
+		if r.program != nil {
+			r.program.Send(ExecutionErrorMsg{
+				CmdIndex:      i,
+				Err:           fmt.Errorf("command failed after %d attempt(s)", cmd.Attempts),
+				FailureReport: report,
+			})
+		}
 		return false
 	}
 
@@ -348,6 +383,37 @@ func (r *Runner) executeSingle(i int, cmd *types.Command) bool {
 	r.sendUpdate(i, types.StatusSuccess, cmd.Output, "")
 	r.saveSession()
 	return true
+}
+
+// writeFailureReport formats and appends a failure report to autoclaude-error.log.
+// Returns the full report string for use in TUI error messages.
+func (r *Runner) writeFailureReport(cmd *types.Command) string {
+	prompt := cmd.Prompt
+	if len(prompt) > 100 {
+		prompt = prompt[:100] + "..."
+	}
+
+	var b strings.Builder
+	b.WriteString("════════════════════════════════════════\n")
+	fmt.Fprintf(&b, "FAILURE REPORT — %s\n", time.Now().Format(time.RFC3339))
+	fmt.Fprintf(&b, "Command: %q\n", prompt)
+	b.WriteString("════════════════════════════════════════\n")
+
+	body := cmd.FormatFailureReport()
+	fullReport := b.String() + "\n" + body + "\n\n"
+
+	logPath := filepath.Join(r.WorkDir, "autoclaude-error.log")
+	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		cmd.Output += fmt.Sprintf("\n[warn] failed to write error log: %v", err)
+		return fullReport
+	}
+	defer f.Close()
+	if _, err := f.WriteString(fullReport); err != nil {
+		cmd.Output += fmt.Sprintf("\n[warn] failed to write error log: %v", err)
+	}
+
+	return fullReport
 }
 
 func (r *Runner) sendUpdate(index int, status types.CommandStatus, output string, detail string) {
