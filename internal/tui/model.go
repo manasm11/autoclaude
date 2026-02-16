@@ -287,6 +287,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				cmds[m.resumeIndex].Attempts = 0
 				cmds[m.resumeIndex].AttemptLogs = nil
 				cmds[m.resumeIndex].FixAttempts = 0
+				cmds[m.resumeIndex].LastFailedStep = ""
+				cmds[m.resumeIndex].LastExitCode = 0
+				cmds[m.resumeIndex].LastStderr = ""
+				cmds[m.resumeIndex].LastStdout = ""
 			} else {
 				cmds[m.resumeIndex].Attempts = len(cmds[m.resumeIndex].AttemptLogs)
 			}

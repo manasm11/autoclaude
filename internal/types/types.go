@@ -173,8 +173,6 @@ func ParseCommandStatus(s string) CommandStatus {
 		return StatusSuccess
 	case "Failed":
 		return StatusFailed
-	case "Retrying":
-		return StatusRetrying
 	case "Fixing":
 		return StatusFixing
 	default:
@@ -200,15 +198,19 @@ type SessionAttemptLog struct {
 
 // SessionCommand is a JSON-friendly representation of a Command for session persistence.
 type SessionCommand struct {
-	Prompt      string              `json:"prompt"`
-	Verify      string              `json:"verify,omitempty"`
-	MaxRetries  int                 `json:"max_retries"`
-	Status      string              `json:"status"`
-	Attempts    int                 `json:"attempts"`
-	FixAttempts int                 `json:"fix_attempts,omitempty"`
-	Output      string              `json:"output,omitempty"`
-	PlanOutput  string              `json:"plan_output,omitempty"`
-	AttemptLogs []SessionAttemptLog `json:"attempt_logs,omitempty"`
+	Prompt         string              `json:"prompt"`
+	Verify         string              `json:"verify,omitempty"`
+	MaxRetries     int                 `json:"max_retries"`
+	Status         string              `json:"status"`
+	Attempts       int                 `json:"attempts"`
+	FixAttempts    int                 `json:"fix_attempts,omitempty"`
+	Output         string              `json:"output,omitempty"`
+	PlanOutput     string              `json:"plan_output,omitempty"`
+	AttemptLogs    []SessionAttemptLog `json:"attempt_logs,omitempty"`
+	LastFailedStep string              `json:"last_failed_step,omitempty"`
+	LastExitCode   int                 `json:"last_exit_code,omitempty"`
+	LastStderr     string              `json:"last_stderr,omitempty"`
+	LastStdout     string              `json:"last_stdout,omitempty"`
 }
 
 // ToSessionCommand converts a Command to a SessionCommand for serialization.
@@ -231,15 +233,19 @@ func (c *Command) ToSessionCommand() SessionCommand {
 		})
 	}
 	return SessionCommand{
-		Prompt:      c.Prompt,
-		Verify:      c.Verify,
-		MaxRetries:  c.MaxRetries,
-		Status:      c.Status.String(),
-		Attempts:    c.Attempts,
-		FixAttempts: c.FixAttempts,
-		Output:      c.Output,
-		PlanOutput:  c.PlanOutput,
-		AttemptLogs: sessionLogs,
+		Prompt:         c.Prompt,
+		Verify:         c.Verify,
+		MaxRetries:     c.MaxRetries,
+		Status:         c.Status.String(),
+		Attempts:       c.Attempts,
+		FixAttempts:    c.FixAttempts,
+		Output:         c.Output,
+		PlanOutput:     c.PlanOutput,
+		AttemptLogs:    sessionLogs,
+		LastFailedStep: c.LastFailedStep,
+		LastExitCode:   c.LastExitCode,
+		LastStderr:     c.LastStderr,
+		LastStdout:     c.LastStdout,
 	}
 }
 
@@ -265,14 +271,18 @@ func FromSessionCommand(sc SessionCommand) *Command {
 		})
 	}
 	return &Command{
-		Prompt:      sc.Prompt,
-		Verify:      sc.Verify,
-		MaxRetries:  sc.MaxRetries,
-		Status:      ParseCommandStatus(sc.Status),
-		Attempts:    sc.Attempts,
-		FixAttempts: sc.FixAttempts,
-		Output:      sc.Output,
-		PlanOutput:  sc.PlanOutput,
-		AttemptLogs: logs,
+		Prompt:         sc.Prompt,
+		Verify:         sc.Verify,
+		MaxRetries:     sc.MaxRetries,
+		Status:         ParseCommandStatus(sc.Status),
+		Attempts:       sc.Attempts,
+		FixAttempts:    sc.FixAttempts,
+		Output:         sc.Output,
+		PlanOutput:     sc.PlanOutput,
+		AttemptLogs:    logs,
+		LastFailedStep: sc.LastFailedStep,
+		LastExitCode:   sc.LastExitCode,
+		LastStderr:     sc.LastStderr,
+		LastStdout:     sc.LastStdout,
 	}
 }

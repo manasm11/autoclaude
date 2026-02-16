@@ -278,7 +278,7 @@ Resuming previous session from command 3/5
 
 ### Resetting attempt counters
 
-When resuming a session, autoclaude preserves the retry history from the previous run. If a command used 2 of its 3 attempts before the session was interrupted, it will only get 1 more attempt on resume. The resume screen shows this: `(2/3 attempts used)`.
+When resuming a session, autoclaude preserves the full retry and fix state from the previous run. If a command used 2 of its 3 fix attempts before the session was interrupted, it will only get 1 more fix attempt on resume. The failure context (which step failed, exit code, stdout/stderr) is also preserved, so if the command fails again on resume, the auto-fix prompt has accurate context from the previous failure. The resume screen shows this: `(2/3 attempts used)`.
 
 If you've manually fixed an issue and want to give the command a full fresh retry budget, use `--reset-attempts`:
 
@@ -287,7 +287,7 @@ autoclaude --reset-attempts
 autoclaude --reset-attempts --auto-run
 ```
 
-This clears the attempt logs and resets the counter to 0, so the command gets all `max_retries` attempts again.
+This clears the attempt logs, resets all counters to 0, and clears the stored failure context, so the command gets all `max_retries` attempts again with a clean slate.
 
 ### Session file location
 
