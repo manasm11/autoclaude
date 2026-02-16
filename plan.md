@@ -1,229 +1,317 @@
-# Implementation Plan: AttemptLog Struct & FormatFailureReport
+# Implementation Plan: Populate AttemptLog Entries in Execution Loop
 
-## Overview
+## File to Modify
 
-Add per-attempt structured logging to commands so that each retry captures detailed context (stdout, stderr, exit code, git state, timing). Expose a `FormatFailureReport()` method for readable debug output. Persist attempt logs through session resume.
+**`internal/runner/runner.go`** — the only file that needs changes.
 
-**Only one file is modified: `internal/types/types.go`.** The session layer (`internal/session/session.go`) requires no changes because it already serializes/deserializes `[]types.SessionCommand` via JSON — the new fields flow through automatically.
+No new files. No changes to `internal/types/types.go` (the `AttemptLog` struct already has all needed fields).
 
 ---
 
-## File: `internal/types/types.go`
+## Overview of Changes
 
-### Change 1: Add imports
+The `executeSingle` method currently runs the retry loop without recording any `AttemptLog` entries. We need to:
 
-Add a new import block at the top (the file currently has no imports):
+1. Add a helper method to capture git context
+2. Modify `runClaude` and `runVerify` to return `CommandResult` (they currently discard it)
+3. Restructure the retry loop in `executeSingle` to build an `AttemptLog` per attempt and append it to `cmd.AttemptLogs` on every exit path
 
+---
+
+## Detailed Changes
+
+### Change 1: Add `captureGitContext` helper method
+
+**Location:** After the `runVerify` method (after line 382), add a new method on `*Runner`.
+
+**Function signature:**
 ```go
-import (
-    "fmt"
-    "strings"
-    "time"
-)
+func (r *Runner) captureGitContext() (branch string, status string)
 ```
 
-- `time` — needed by `AttemptLog` fields (`time.Time`, `time.Duration`)
-- `fmt` — needed by `FormatFailureReport()` for `Sprintf`
-- `strings` — needed by `FormatFailureReport()` for `Builder` and `Repeat`
+**Behavior:**
+- Run `exec.Command("git", "branch", "--show-current")` with `Dir` set to `r.WorkDir`. Capture stdout via `cmd.Output()`. On any error, return `""` for branch.
+- Run `exec.Command("git", "status", "--porcelain")` with `Dir` set to `r.WorkDir`. Capture stdout via `cmd.Output()`. On any error, return `""` for status.
+- Trim whitespace (`strings.TrimSpace`) from both outputs before returning.
+- These are quick local commands, no need for context cancellation or streaming.
 
----
+### Change 2: Update `runClaude` to return `CommandResult`
 
-### Change 2: Add `AttemptLog` struct
+**Location:** Lines 374-377, the `runClaude` method.
 
-Insert after the `String()` method on `CommandStatus` (after line 35), before the `Command` struct:
-
+**Current signature:**
 ```go
-// AttemptLog captures details of a single execution attempt for debugging.
-type AttemptLog struct {
-    AttemptNumber int
-    StartedAt     time.Time
-    EndedAt       time.Time
-    Duration      time.Duration
-    FailedStep    string // "planning", "execution", "verification", or "" for success
-    Command       string // the prompt or shell command that was run
-    ExitCode      int
-    Stdout        string
-    Stderr        string
-    WorkDir       string
-    GitBranch     string
-    GitStatus     string
+func (r *Runner) runClaude(cmdIndex int, prompt string) (string, error)
+```
+
+**New signature:**
+```go
+func (r *Runner) runClaude(cmdIndex int, prompt string) (string, CommandResult, error)
+```
+
+**Change:** Instead of discarding the `CommandResult` with `_`, return it:
+```go
+func (r *Runner) runClaude(cmdIndex int, prompt string) (string, CommandResult, error) {
+    return r.runCommandStreaming(cmdIndex, "claude", "--dangerously-skip-permissions", "-p", prompt)
 }
 ```
 
-12 fields as specified. `FailedStep` uses empty string to indicate success.
+### Change 3: Update `runVerify` to return `CommandResult`
 
----
+**Location:** Lines 379-382, the `runVerify` method.
 
-### Change 3: Add `AttemptLogs` field to `Command` struct
-
-Add after the existing `Attempts int` field (line 46):
-
+**Current signature:**
 ```go
-AttemptLogs []AttemptLog // structured log of each attempt
+func (r *Runner) runVerify(cmdIndex int, verifyCmd string) (string, error)
 ```
 
-Full struct becomes:
-
+**New signature:**
 ```go
-type Command struct {
-    Prompt      string
-    Verify      string
-    MaxRetries  int
-    Status      CommandStatus
-    Output      string
-    PlanOutput  string
-    Attempts    int
-    AttemptLogs []AttemptLog
+func (r *Runner) runVerify(cmdIndex int, verifyCmd string) (string, CommandResult, error)
+```
+
+**Change:** Same pattern — return the `CommandResult`:
+```go
+func (r *Runner) runVerify(cmdIndex int, verifyCmd string) (string, CommandResult, error) {
+    return r.runCommandStreaming(cmdIndex, "sh", "-c", verifyCmd)
 }
 ```
 
-No change to `NewCommand()` — `AttemptLogs` will be `nil` by default, which is correct.
+### Change 4: Restructure `executeSingle` to populate AttemptLog
 
----
+This is the main change. The method at lines 137-258 needs restructuring within the retry loop.
 
-### Change 4: Add `FormatFailureReport()` method on `*Command`
+#### 4a: Add helper closures at the top of `executeSingle`
 
-Insert after `NewCommand()` (after line 54). Signature:
-
-```go
-func (c *Command) FormatFailureReport() string
-```
-
-**Logic:**
-
-1. If `len(c.AttemptLogs) == 0`, return `"No attempt logs recorded.\n"`.
-2. Create a `strings.Builder`.
-3. Write header: `fmt.Sprintf("Failure Report for: %s\n", truncatedPrompt)` where `truncatedPrompt` is `c.Prompt` truncated to 80 characters with `"..."` appended if longer.
-4. Write separator: `strings.Repeat("=", 60) + "\n"`.
-5. Write summary: `fmt.Sprintf("Total attempts: %d\n", len(c.AttemptLogs))`.
-6. For each `log` in `c.AttemptLogs`:
-   - `fmt.Sprintf("\n--- Attempt %d ---\n", log.AttemptNumber)`
-   - `fmt.Sprintf("  Started:   %s\n", log.StartedAt.Format("2006-01-02 15:04:05"))`
-   - `fmt.Sprintf("  Ended:     %s\n", log.EndedAt.Format("2006-01-02 15:04:05"))`
-   - `fmt.Sprintf("  Duration:  %s\n", log.Duration)`
-   - `fmt.Sprintf("  Exit Code: %d\n", log.ExitCode)`
-   - If `log.FailedStep != ""`: `fmt.Sprintf("  Failed Step: %s\n", log.FailedStep)`
-   - If `log.WorkDir != ""`: `fmt.Sprintf("  Work Dir:  %s\n", log.WorkDir)`
-   - If `log.GitBranch != ""`: `fmt.Sprintf("  Git Branch: %s\n", log.GitBranch)`
-   - If `log.GitStatus != ""`: `fmt.Sprintf("  Git Status: %s\n", log.GitStatus)`
-   - If `log.Command != ""`: `fmt.Sprintf("  Command:   %s\n", log.Command)`
-   - `"\n  --- Stdout ---\n"` then either `log.Stdout` or `"  (empty)"`, followed by `"\n"`
-   - `"\n  --- Stderr ---\n"` then either `log.Stderr` or `"  (empty)"`, followed by `"\n"`
-7. Write final separator: `strings.Repeat("=", 60) + "\n"`.
-8. Return `builder.String()`.
-
----
-
-### Change 5: Add `SessionAttemptLog` struct for JSON serialization
-
-Insert just before the existing `SessionCommand` struct (before line 84):
+Right after the `success := false` declaration (line 138), add two helper closures:
 
 ```go
-// SessionAttemptLog is a JSON-friendly representation of AttemptLog for session persistence.
-type SessionAttemptLog struct {
-    AttemptNumber int    `json:"attempt_number"`
-    StartedAt     string `json:"started_at"`            // RFC3339 format
-    EndedAt       string `json:"ended_at"`              // RFC3339 format
-    DurationMs    int64  `json:"duration_ms"`           // milliseconds
-    FailedStep    string `json:"failed_step,omitempty"`
-    Command       string `json:"command,omitempty"`
-    ExitCode      int    `json:"exit_code"`
-    Stdout        string `json:"stdout,omitempty"`
-    Stderr        string `json:"stderr,omitempty"`
-    WorkDir       string `json:"work_dir,omitempty"`
-    GitBranch     string `json:"git_branch,omitempty"`
-    GitStatus     string `json:"git_status,omitempty"`
+finalizeAttempt := func(log *types.AttemptLog, failedStep string, exitCode int, stdoutBuf, stderrBuf *strings.Builder) {
+    log.FailedStep = failedStep
+    log.ExitCode = exitCode
+    log.EndedAt = time.Now()
+    log.Duration = log.EndedAt.Sub(log.StartedAt)
+    log.Stdout = stdoutBuf.String()
+    log.Stderr = stderrBuf.String()
+    cmd.AttemptLogs = append(cmd.AttemptLogs, *log)
+}
+
+updateLastAttempt := func(result CommandResult, failedStep string) {
+    if len(cmd.AttemptLogs) == 0 {
+        return
+    }
+    last := &cmd.AttemptLogs[len(cmd.AttemptLogs)-1]
+    last.Stdout += result.Stdout
+    last.Stderr += result.Stderr
+    if failedStep != "" {
+        last.FailedStep = failedStep
+        last.ExitCode = result.ExitCode
+    }
+    last.EndedAt = time.Now()
+    last.Duration = last.EndedAt.Sub(last.StartedAt)
 }
 ```
 
-**Rationale:** `time.Time` and `time.Duration` need explicit formatting for clean JSON. RFC3339 for timestamps, milliseconds (int64) for duration.
+#### 4b: At the top of each retry iteration (after `cmd.Attempts++`, line 140)
 
----
+Add the following steps immediately after `cmd.Attempts++`:
 
-### Change 6: Add `AttemptLogs` field to `SessionCommand` struct
+1. Record `attemptStart := time.Now()`
+2. Call `gitBranch, gitStatus := r.captureGitContext()`
+3. Initialize an `AttemptLog` struct:
+   ```go
+   attemptLog := types.AttemptLog{
+       AttemptNumber: cmd.Attempts,
+       StartedAt:     attemptStart,
+       WorkDir:       r.WorkDir,
+       GitBranch:     gitBranch,
+       GitStatus:     gitStatus,
+   }
+   ```
+4. Initialize accumulator variables for stdout/stderr across steps within this attempt:
+   ```go
+   var attemptStdout, attemptStderr strings.Builder
+   ```
 
-Add after the existing `PlanOutput` field:
+#### 4c: Planning step (lines 143-165)
 
+**Current code calls:**
 ```go
-AttemptLogs []SessionAttemptLog `json:"attempt_logs,omitempty"`
+planOutput, planErr := r.runClaude(i, planPrompt)
 ```
 
-The `omitempty` ensures backward compatibility — old session files without this field will deserialize cleanly (nil slice), and new session files without attempt logs won't bloat the JSON.
+**Change to:**
+```go
+planOutput, planResult, planErr := r.runClaude(i, planPrompt)
+```
+
+After the call, accumulate stdout/stderr:
+```go
+attemptStdout.WriteString(planResult.Stdout)
+attemptStderr.WriteString(planResult.Stderr)
+```
+
+Record the command string in `attemptLog`:
+```go
+attemptLog.Command = fmt.Sprintf("claude --dangerously-skip-permissions -p [planning prompt, %d chars]", len(planPrompt))
+```
+
+On **planning failure** — both the `continue` path (line 155, when retries remain) and the `return false` path (line 161, when retries exhausted) — insert before `continue` or `return false`:
+```go
+finalizeAttempt(&attemptLog, "Planning", planResult.ExitCode, &attemptStdout, &attemptStderr)
+```
+
+#### 4d: Execution step (lines 167-189)
+
+**Current code calls:**
+```go
+execOutput, execErr := r.runClaude(i, execPrompt)
+```
+
+**Change to:**
+```go
+execOutput, execResult, execErr := r.runClaude(i, execPrompt)
+```
+
+After the call, accumulate:
+```go
+attemptStdout.WriteString(execResult.Stdout)
+attemptStderr.WriteString(execResult.Stderr)
+```
+
+Update the command string (overwrite the planning command — the log now reflects the last step attempted):
+```go
+attemptLog.Command = fmt.Sprintf("claude --dangerously-skip-permissions -p [execution prompt, %d chars]", len(execPrompt))
+```
+
+On **execution failure** (both `continue` and `return false` paths), insert before `continue` or `return false`:
+```go
+finalizeAttempt(&attemptLog, "Running", execResult.ExitCode, &attemptStdout, &attemptStderr)
+```
+
+#### 4e: Verification step (lines 192-213)
+
+**Current code calls:**
+```go
+verifyOutput, verifyErr := r.runVerify(i, cmd.Verify)
+```
+
+**Change to:**
+```go
+verifyOutput, verifyResult, verifyErr := r.runVerify(i, cmd.Verify)
+```
+
+After the call, accumulate:
+```go
+attemptStdout.WriteString(verifyResult.Stdout)
+attemptStderr.WriteString(verifyResult.Stderr)
+```
+
+Update the command string:
+```go
+attemptLog.Command = cmd.Verify
+```
+
+On **verification failure** (both paths), insert before `continue` or `return false`:
+```go
+finalizeAttempt(&attemptLog, "Verifying", verifyResult.ExitCode, &attemptStdout, &attemptStderr)
+```
+
+#### 4f: On successful completion of the retry loop (before `break` at line 217)
+
+When plan + execution + verify all pass, we still need to log the attempt. Before `break`, insert:
+```go
+finalizeAttempt(&attemptLog, "", 0, &attemptStdout, &attemptStderr)
+```
+
+An empty `FailedStep` with exit code 0 indicates success.
+
+#### 4g: Documentation step (lines 228-241) — post-retry-loop, success path only
+
+**Current code calls:**
+```go
+docOutput, docErr := r.runClaude(i, docPrompt)
+```
+
+**Change to:**
+```go
+docOutput, docResult, docErr := r.runClaude(i, docPrompt)
+```
+
+After the call (regardless of success/failure), update the last AttemptLog:
+- If `docErr != nil`: `updateLastAttempt(docResult, "Documenting")`
+- If `docErr == nil`: `updateLastAttempt(docResult, "")` (just accumulate output, don't mark failure since doc is non-fatal — but we still want stdout/stderr captured)
+
+**Note:** Since documentation is non-fatal, even if we set FailedStep to "Documenting", the overall command still proceeds to commit. The FailedStep field here records what went wrong, not that the whole command failed.
+
+#### 4h: Commit step (lines 244-257) — post-retry-loop, success path only
+
+**Current code calls:**
+```go
+commitOutput, commitErr := r.runClaude(i, "Git add all changes...")
+```
+
+**Change to:**
+```go
+commitOutput, commitResult, commitErr := r.runClaude(i, "Git add all changes...")
+```
+
+After the call, update the last AttemptLog:
+- If `commitErr != nil`: `updateLastAttempt(commitResult, "Committing")`
+- If `commitErr == nil`: `updateLastAttempt(commitResult, "")`
 
 ---
 
-### Change 7: Update `ToSessionCommand()` to convert AttemptLogs
+## Summary of All Call Sites Changed
 
-In the existing method (line 95–105), after building the `SessionCommand` literal, add conversion of `AttemptLogs`:
-
-- Declare a `var sessionLogs []SessionAttemptLog`.
-- If `len(c.AttemptLogs) > 0`:
-  - Allocate `sessionLogs = make([]SessionAttemptLog, len(c.AttemptLogs))`.
-  - For each index `i`, map:
-    - `AttemptNumber` → direct copy
-    - `StartedAt` → `c.AttemptLogs[i].StartedAt.Format(time.RFC3339)`
-    - `EndedAt` → `c.AttemptLogs[i].EndedAt.Format(time.RFC3339)`
-    - `DurationMs` → `c.AttemptLogs[i].Duration.Milliseconds()`
-    - All other fields (`FailedStep`, `Command`, `ExitCode`, `Stdout`, `Stderr`, `WorkDir`, `GitBranch`, `GitStatus`) → direct copy
-- Set the `AttemptLogs` field on the returned `SessionCommand`.
+| Step | Current Call | New Call | On Failure | AttemptLog.FailedStep |
+|------|-------------|----------|------------|----------------------|
+| Planning | `runClaude(i, planPrompt)` → `(string, error)` | `runClaude(i, planPrompt)` → `(string, CommandResult, error)` | `finalizeAttempt(...)` + continue/return | `"Planning"` |
+| Execution | `runClaude(i, execPrompt)` → `(string, error)` | `runClaude(i, execPrompt)` → `(string, CommandResult, error)` | `finalizeAttempt(...)` + continue/return | `"Running"` |
+| Verification | `runVerify(i, cmd.Verify)` → `(string, error)` | `runVerify(i, cmd.Verify)` → `(string, CommandResult, error)` | `finalizeAttempt(...)` + continue/return | `"Verifying"` |
+| Documentation | `runClaude(i, docPrompt)` → `(string, error)` | `runClaude(i, docPrompt)` → `(string, CommandResult, error)` | `updateLastAttempt(...)` | `"Documenting"` |
+| Commit | `runClaude(i, commitPrompt)` → `(string, error)` | `runClaude(i, commitPrompt)` → `(string, CommandResult, error)` | `updateLastAttempt(...)` | `"Committing"` |
 
 ---
 
-### Change 8: Update `FromSessionCommand()` to convert AttemptLogs
+## Import Changes
 
-In the existing function (line 108–118), after building the `Command` literal, add conversion of `AttemptLogs`:
-
-- Declare a `var logs []AttemptLog`.
-- If `len(sc.AttemptLogs) > 0`:
-  - Allocate `logs = make([]AttemptLog, len(sc.AttemptLogs))`.
-  - For each index `i`, map:
-    - `AttemptNumber` → direct copy
-    - `StartedAt` → `time.Parse(time.RFC3339, sc.AttemptLogs[i].StartedAt)` — ignore error, zero `time.Time` is acceptable fallback for corrupted data
-    - `EndedAt` → `time.Parse(time.RFC3339, sc.AttemptLogs[i].EndedAt)` — same
-    - `Duration` → `time.Duration(sc.AttemptLogs[i].DurationMs) * time.Millisecond`
-    - All other fields → direct copy
-- Set the `AttemptLogs` field on the returned `*Command`.
-
----
-
-## File: `internal/session/session.go`
-
-### No changes needed
-
-`SessionState.Commands` is `[]types.SessionCommand`. The `Save()` function uses `json.MarshalIndent` and `Load()` uses `json.Unmarshal`. Since the new `AttemptLogs` field is added to `SessionCommand` with proper JSON tags, serialization and deserialization happen automatically. The `ToCommands()` helper already calls `types.FromSessionCommand()` which we're updating in types.go.
+No new imports needed. `runner.go` already imports all required packages:
+- `"os/exec"` — for `captureGitContext`
+- `"strings"` — for `strings.TrimSpace` and `strings.Builder`
+- `"time"` — for `time.Now()`
+- `"fmt"` — for `fmt.Sprintf`
+- `"github.com/manasm11/autoclaude/internal/types"` — for `types.AttemptLog`
 
 ---
 
 ## Edge Cases
 
-1. **Empty AttemptLogs**: `FormatFailureReport()` returns `"No attempt logs recorded.\n"` when no logs exist. `ToSessionCommand()` and `FromSessionCommand()` handle nil/empty slices via the length check.
+1. **Git not available:** `captureGitContext` must handle `exec.Command` returning an error (e.g., git not installed, not a git repo). Return empty strings — already covered by ignoring errors from `cmd.Output()`.
 
-2. **Backward compatibility (old session files)**: Old JSON files won't have `attempt_logs`. `json.Unmarshal` leaves the field as `nil` — this is correct. Old code reading new session files ignores unknown fields. Full bidirectional compatibility.
+2. **First attempt with resumed session that already has a plan:** The planning step is skipped (`cmd.PlanOutput != ""`), so no planning `CommandResult` is generated. The `attemptLog.Command` will only reflect the execution step. `attemptStdout`/`attemptStderr` will only contain execution output. This is correct behavior — the skipped step contributes nothing to capture.
 
-3. **Time parse errors on resume**: If `StartedAt`/`EndedAt` strings are malformed (corrupted session), `time.Parse` returns zero time. `FormatFailureReport()` will show `"0001-01-01 00:00:00"` which clearly signals corruption without crashing.
+3. **Documentation/commit failures are non-fatal:** These happen outside the retry loop. `updateLastAttempt` updates the already-appended last AttemptLog entry in-place. If the doc step fails but commit succeeds, the FailedStep gets overwritten to `""` by the successful commit `updateLastAttempt` call. To avoid this, only call `updateLastAttempt` with a non-empty failedStep when there's an error; pass `""` otherwise so the FailedStep isn't cleared if previously set.
 
-4. **Large stdout/stderr**: No truncation in the struct or `FormatFailureReport()`. The data should be preserved complete for debugging. Callers can truncate for display if needed.
+   **Refinement for `updateLastAttempt`:** Change the conditional to: only overwrite `FailedStep` and `ExitCode` if `failedStep != ""`. This way a successful commit won't clear a "Documenting" failure.
 
-5. **Long prompts in report header**: Truncated to 80 characters with `"..."` to keep the report header readable.
+4. **Context cancellation:** If `r.ctx` is cancelled mid-execution, `runCommandStreaming` returns an error with ExitCode=-1. The standard flow handles it since we finalize on any error.
 
-6. **Successful attempts**: `AttemptLog` with `FailedStep: ""` represents success. `FormatFailureReport()` omits the "Failed Step" line for these entries.
+5. **Empty stdout/stderr:** `CommandResult.Stdout` and `.Stderr` may be empty strings. This is fine — `AttemptLog` fields accept empty strings and `FormatFailureReport` already guards against them.
 
-7. **Duration precision**: Stored as milliseconds in JSON (int64). Sufficient for command execution timing. No floating-point issues.
+6. **The `!success` fallthrough after the retry loop (line 220-225):** This path is reached when `cmd.Attempts >= cmd.MaxRetries` without a `break`. The last iteration's AttemptLog was already appended inside the loop body (at each `continue` or `return false` site), so no additional append is needed here.
 
-8. **Zero-value AttemptLog**: All fields have sensible zero values. An uninitialized `AttemptLog` won't cause panics in `FormatFailureReport()`.
+7. **AttemptLog.Command field — full prompt vs abbreviated:** The full `planPrompt`/`execPrompt` strings can be very long. Store an abbreviated form: `fmt.Sprintf("claude --dangerously-skip-permissions -p [planning prompt, %d chars]", len(planPrompt))`. This keeps logs readable. For verification, store the actual verify command string since those are typically short.
+
+8. **`saveSession()` calls after AttemptLog appends:** The existing `saveSession()` calls remain in their current positions. Since `cmd.AttemptLogs` is appended before `saveSession()` is called (the `finalizeAttempt` call is inserted before the `continue`/`return false` which are before the `saveSession()` calls... wait, checking the code):
+   - On the retry+continue path: the code does `r.sendUpdate(...)` then `r.saveSession()` then `continue`. The `finalizeAttempt` call should go **before** `r.sendUpdate` so the session save captures the new AttemptLog.
+   - On the return false path: same pattern — `finalizeAttempt` before `r.sendUpdate` and `r.saveSession`.
+   - This ensures AttemptLogs are persisted to the session file.
 
 ---
 
-## Summary
+## Testing Considerations
 
-| Location | Change |
-|---|---|
-| `internal/types/types.go` | Add `"fmt"`, `"strings"`, `"time"` imports |
-| `internal/types/types.go` | Add `AttemptLog` struct (12 fields) |
-| `internal/types/types.go` | Add `AttemptLogs []AttemptLog` field to `Command` |
-| `internal/types/types.go` | Add `FormatFailureReport() string` method on `*Command` |
-| `internal/types/types.go` | Add `SessionAttemptLog` struct (12 JSON-tagged fields) |
-| `internal/types/types.go` | Add `AttemptLogs []SessionAttemptLog` field to `SessionCommand` |
-| `internal/types/types.go` | Update `ToSessionCommand()` to convert `[]AttemptLog` → `[]SessionAttemptLog` |
-| `internal/types/types.go` | Update `FromSessionCommand()` to convert `[]SessionAttemptLog` → `[]AttemptLog` |
-| `internal/session/session.go` | **No changes** — automatic via existing JSON marshaling |
+- Run `go build -o autoclaude .` to verify compilation.
+- Run `go test ./...` to verify existing tests pass with the new `runClaude`/`runVerify` signatures.
+- If any existing tests call `runClaude` or `runVerify` directly, they'll need updating for the 3-return-value signatures.

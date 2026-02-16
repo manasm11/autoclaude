@@ -29,14 +29,17 @@ go test ./...
 - `runCommandStreaming` is the core function for all subprocess execution (Claude invocations and verify commands). It streams output line-by-line to the TUI via BubbleTea messages.
 - **Separated stdout/stderr capture**: `runCommandStreaming` returns a `CommandResult` struct containing separate `Stdout`, `Stderr`, and `ExitCode` fields. Uses `io.TeeReader` to simultaneously stream to the TUI and buffer stdout/stderr independently.
 - **Exit code extraction**: On error, the exit code is extracted via type assertion to `*exec.ExitError`. If the error is not an `ExitError` (e.g. process couldn't start), exit code is `-1`.
-- `runClaude` and `runVerify` are thin wrappers around `runCommandStreaming`. They currently use only the combined output string and error; the `CommandResult` is available for future use.
+- `runClaude` and `runVerify` are thin wrappers around `runCommandStreaming`. They return `(string, CommandResult, error)` — the `CommandResult` carries separated stdout/stderr/exit code for attempt logging.
+- `captureGitContext()` runs `git branch --show-current` and `git status --porcelain` via `exec.Command` (not streaming). Errors are silently ignored (returns empty strings if git is unavailable).
 
-### Attempt logging (internal/types/types.go)
+### Attempt logging
 
-- `AttemptLog` records per-attempt details: timing (start/end/duration), failed step, exit code, stdout/stderr, working directory, and git state (branch, status).
-- `Command.AttemptLogs` accumulates one entry per retry attempt.
-- `Command.FormatFailureReport()` renders all attempt logs into a human-readable debug report with indented stdout/stderr.
-- Session persistence uses `SessionAttemptLog` (JSON-friendly mirror of `AttemptLog`) with time as RFC3339 strings and duration as milliseconds. Conversion helpers: `ToSessionCommand()` / `FromSessionCommand()` handle the mapping.
+- **Type definitions** (`internal/types/types.go`): `AttemptLog` records per-attempt details: timing (start/end/duration), failed step, exit code, stdout/stderr, working directory, and git state (branch, status). `Command.FormatFailureReport()` renders all attempt logs into a human-readable debug report. Session persistence uses `SessionAttemptLog` (JSON-friendly mirror) with RFC3339 times and millisecond durations.
+- **Population** (`internal/runner/runner.go`): `executeSingle` populates `cmd.AttemptLogs` on every attempt. Two closures handle this:
+  - `finalizeAttempt` — called once per retry-loop iteration (both success and failure). Sets EndedAt/Duration/ExitCode/FailedStep, copies accumulated stdout/stderr from `strings.Builder` accumulators, and appends to `cmd.AttemptLogs`.
+  - `updateLastAttempt` — called for post-loop steps (documenting, committing) that extend the final attempt's log in place. Only overwrites FailedStep/ExitCode if the step actually failed (non-empty failedStep), preventing a successful commit from clearing a prior "Documenting" failure.
+- Pre-attempt context: each iteration captures git branch/status via `captureGitContext()` and records WorkDir before any steps run.
+- Stdout/stderr from each step (`runClaude`/`runVerify`) are accumulated into per-attempt `strings.Builder` buffers, then snapshotted into the AttemptLog at finalization.
 
 ### Execution flow
 

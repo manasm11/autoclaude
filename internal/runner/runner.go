@@ -136,8 +136,57 @@ func (r *Runner) executeFrom(startIndex int) {
 // Returns true if the command succeeded, false if it permanently failed.
 func (r *Runner) executeSingle(i int, cmd *types.Command) bool {
 	success := false
+
+	// Accumulators for the current attempt's stdout/stderr across all steps.
+	var attemptStdout, attemptStderr strings.Builder
+
+	// finalizeAttempt fills in the terminal fields of an AttemptLog and appends it
+	// to cmd.AttemptLogs. It is called once per retry-loop iteration.
+	finalizeAttempt := func(log types.AttemptLog, failedStep string, exitCode int) {
+		log.FailedStep = failedStep
+		log.ExitCode = exitCode
+		log.EndedAt = time.Now()
+		log.Duration = log.EndedAt.Sub(log.StartedAt)
+		log.Stdout = attemptStdout.String()
+		log.Stderr = attemptStderr.String()
+		cmd.AttemptLogs = append(cmd.AttemptLogs, log)
+	}
+
+	// updateLastAttempt updates the most-recently-appended AttemptLog in place.
+	// Used for post-loop steps (doc, commit) that extend the final attempt.
+	updateLastAttempt := func(failedStep string, exitCode int) {
+		if len(cmd.AttemptLogs) == 0 {
+			return
+		}
+		last := &cmd.AttemptLogs[len(cmd.AttemptLogs)-1]
+		if failedStep != "" {
+			last.FailedStep = failedStep
+		}
+		if exitCode != 0 {
+			last.ExitCode = exitCode
+		}
+		last.EndedAt = time.Now()
+		last.Duration = last.EndedAt.Sub(last.StartedAt)
+		last.Stdout = attemptStdout.String()
+		last.Stderr = attemptStderr.String()
+	}
+
 	for cmd.Attempts < cmd.MaxRetries {
 		cmd.Attempts++
+
+		// Reset per-attempt accumulators.
+		attemptStdout.Reset()
+		attemptStderr.Reset()
+
+		// Initialize attempt log with pre-attempt context.
+		gitBranch, gitStatus := r.captureGitContext()
+		attemptLog := types.AttemptLog{
+			AttemptNumber: cmd.Attempts,
+			StartedAt:     time.Now(),
+			WorkDir:       r.WorkDir,
+			GitBranch:     gitBranch,
+			GitStatus:     gitStatus,
+		}
 
 		// 1. PLANNING — skip if we already have a plan (e.g. resumed session)
 		if cmd.PlanOutput == "" {
@@ -146,8 +195,12 @@ func (r *Runner) executeSingle(i int, cmd *types.Command) bool {
 			r.saveSession()
 
 			planPrompt := "You are planning the implementation of a task. Create a detailed step-by-step implementation plan. List every file to create or modify, what exact changes to make in each file, function signatures, and edge cases to handle. Do NOT write any code, do NOT create or modify any files. Only output the plan in markdown.\n\nTask: " + cmd.Prompt
-			planOutput, planErr := r.runClaude(i, planPrompt)
+			attemptLog.Command = "claude -p <planning prompt>"
+			planOutput, planResult, planErr := r.runClaude(i, planPrompt)
+			attemptStdout.WriteString(planResult.Stdout)
+			attemptStderr.WriteString(planResult.Stderr)
 			if planErr != nil {
+				finalizeAttempt(attemptLog, "Planning", planResult.ExitCode)
 				if cmd.Attempts < cmd.MaxRetries {
 					cmd.Status = types.StatusRetrying
 					r.sendUpdate(i, types.StatusRetrying, planOutput)
@@ -171,11 +224,15 @@ func (r *Runner) executeSingle(i int, cmd *types.Command) bool {
 		r.saveSession()
 
 		execPrompt := "Execute the following implementation plan exactly. Follow each step precisely.\n\nPlan:\n" + cmd.PlanOutput + "\n\nOriginal task: " + cmd.Prompt
-		execOutput, execErr := r.runClaude(i, execPrompt)
+		attemptLog.Command = "claude -p <execution prompt>"
+		execOutput, execResult, execErr := r.runClaude(i, execPrompt)
+		attemptStdout.WriteString(execResult.Stdout)
+		attemptStderr.WriteString(execResult.Stderr)
 		cmd.Output = cmd.Output + execOutput
 
 		if execErr != nil {
 			cmd.PlanOutput = "" // fresh plan on retry
+			finalizeAttempt(attemptLog, "Running", execResult.ExitCode)
 			if cmd.Attempts < cmd.MaxRetries {
 				cmd.Status = types.StatusRetrying
 				r.sendUpdate(i, types.StatusRetrying, cmd.Output)
@@ -194,11 +251,15 @@ func (r *Runner) executeSingle(i int, cmd *types.Command) bool {
 			r.sendUpdate(i, types.StatusVerifying, cmd.Output)
 			r.saveSession()
 
-			verifyOutput, verifyErr := r.runVerify(i, cmd.Verify)
+			attemptLog.Command = cmd.Verify
+			verifyOutput, verifyResult, verifyErr := r.runVerify(i, cmd.Verify)
+			attemptStdout.WriteString(verifyResult.Stdout)
+			attemptStderr.WriteString(verifyResult.Stderr)
 			cmd.Output = cmd.Output + "\n" + verifyOutput
 
 			if verifyErr != nil {
 				cmd.PlanOutput = "" // fresh plan on retry
+				finalizeAttempt(attemptLog, "Verifying", verifyResult.ExitCode)
 				if cmd.Attempts < cmd.MaxRetries {
 					cmd.Status = types.StatusRetrying
 					r.sendUpdate(i, types.StatusRetrying, cmd.Output)
@@ -212,7 +273,8 @@ func (r *Runner) executeSingle(i int, cmd *types.Command) bool {
 			}
 		}
 
-		// Plan + execution + verify all passed
+		// Plan + execution + verify all passed — log success attempt.
+		finalizeAttempt(attemptLog, "", 0)
 		success = true
 		break
 	}
@@ -231,11 +293,15 @@ func (r *Runner) executeSingle(i int, cmd *types.Command) bool {
 		r.saveSession()
 
 		docPrompt := "Review the changes just made in this project. Update the following documentation files to reflect these changes:\n\n1. CLAUDE.md — This is the project memory file for Claude Code. Update it with any new conventions, architecture decisions, file structure changes, dependencies added, or important patterns established by the recent changes. Create the file if it doesn't exist. Keep it concise and useful as a reference for future Claude Code sessions.\n\n2. README.md — Update the user-facing documentation to reflect any new features, usage changes, API changes, or configuration options introduced by the recent changes. Create the file if it doesn't exist. Do not remove existing content unless it's outdated due to the changes.\n\nOnly update sections relevant to the recent changes. Do not rewrite unrelated sections. If no documentation updates are needed, make no changes.\n\nRecent task that was executed: " + cmd.Prompt
-		docOutput, docErr := r.runClaude(i, docPrompt)
+		docOutput, docResult, docErr := r.runClaude(i, docPrompt)
+		attemptStdout.WriteString(docResult.Stdout)
+		attemptStderr.WriteString(docResult.Stderr)
 		if docErr != nil {
 			cmd.Output = cmd.Output + "\n═══ DOCUMENTATION ═══\n" + fmt.Sprintf("[warn] documentation update failed: %v", docErr)
+			updateLastAttempt("Documenting", docResult.ExitCode)
 		} else {
 			cmd.Output = cmd.Output + "\n═══ DOCUMENTATION ═══\n" + docOutput
+			updateLastAttempt("", 0)
 		}
 		r.sendUpdate(i, types.StatusDocumenting, cmd.Output)
 	}
@@ -245,11 +311,15 @@ func (r *Runner) executeSingle(i int, cmd *types.Command) bool {
 	r.sendUpdate(i, types.StatusCommitting, cmd.Output)
 	r.saveSession()
 
-	commitOutput, commitErr := r.runClaude(i, "Git add all changes, commit with a concise meaningful commit message describing what was done, and push to origin. Do not ask for confirmation.")
+	commitOutput, commitResult, commitErr := r.runClaude(i, "Git add all changes, commit with a concise meaningful commit message describing what was done, and push to origin. Do not ask for confirmation.")
+	attemptStdout.WriteString(commitResult.Stdout)
+	attemptStderr.WriteString(commitResult.Stderr)
 	if commitErr != nil {
 		cmd.Output = cmd.Output + "\n" + fmt.Sprintf("[warn] git commit/push failed: %v", commitErr)
+		updateLastAttempt("Committing", commitResult.ExitCode)
 	} else {
 		cmd.Output = cmd.Output + "\n" + commitOutput
+		updateLastAttempt("", 0)
 	}
 
 	cmd.Status = types.StatusSuccess
@@ -371,12 +441,22 @@ func (r *Runner) runCommandStreaming(cmdIndex int, name string, args ...string) 
 	return output, result, waitErr
 }
 
-func (r *Runner) runClaude(cmdIndex int, prompt string) (string, error) {
-	output, _, err := r.runCommandStreaming(cmdIndex, "claude", "--dangerously-skip-permissions", "-p", prompt)
-	return output, err
+// captureGitContext runs git commands to capture the current branch and working tree status.
+// Errors are silently ignored; empty strings are returned if git is unavailable.
+func (r *Runner) captureGitContext() (branch string, status string) {
+	if out, err := exec.Command("git", "-C", r.WorkDir, "branch", "--show-current").Output(); err == nil {
+		branch = strings.TrimSpace(string(out))
+	}
+	if out, err := exec.Command("git", "-C", r.WorkDir, "status", "--porcelain").Output(); err == nil {
+		status = strings.TrimSpace(string(out))
+	}
+	return
 }
 
-func (r *Runner) runVerify(cmdIndex int, verifyCmd string) (string, error) {
-	output, _, err := r.runCommandStreaming(cmdIndex, "sh", "-c", verifyCmd)
-	return output, err
+func (r *Runner) runClaude(cmdIndex int, prompt string) (string, CommandResult, error) {
+	return r.runCommandStreaming(cmdIndex, "claude", "--dangerously-skip-permissions", "-p", prompt)
+}
+
+func (r *Runner) runVerify(cmdIndex int, verifyCmd string) (string, CommandResult, error) {
+	return r.runCommandStreaming(cmdIndex, "sh", "-c", verifyCmd)
 }
