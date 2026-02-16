@@ -86,7 +86,7 @@ var (
 	statusFailed = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#FF4444"))
 
-	statusRetrying = lipgloss.NewStyle().
+	statusFixing = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#FFD700"))
 
 	indexStyle = lipgloss.NewStyle().
@@ -286,6 +286,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.resetAttempts {
 				cmds[m.resumeIndex].Attempts = 0
 				cmds[m.resumeIndex].AttemptLogs = nil
+				cmds[m.resumeIndex].FixAttempts = 0
 			} else {
 				cmds[m.resumeIndex].Attempts = len(cmds[m.resumeIndex].AttemptLogs)
 			}
@@ -365,7 +366,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.statusDetail = msg.StatusDetail
 
 			if (msg.Status == types.StatusPlanning || msg.Status == types.StatusRunning || msg.Status == types.StatusVerifying ||
-				msg.Status == types.StatusDocumenting || msg.Status == types.StatusCommitting || msg.Status == types.StatusRetrying) &&
+				msg.Status == types.StatusDocumenting || msg.Status == types.StatusCommitting || msg.Status == types.StatusFixing) &&
 				msg.CmdIndex != m.currentCmd {
 				m.currentCmd = msg.CmdIndex
 				m.scrollOffset = 0
@@ -1095,8 +1096,8 @@ func statusStyleFor(s types.CommandStatus) lipgloss.Style {
 		return statusSuccess
 	case types.StatusFailed:
 		return statusFailed
-	case types.StatusRetrying:
-		return statusRetrying
+	case types.StatusFixing:
+		return statusFixing
 	default:
 		return lipgloss.NewStyle()
 	}
@@ -1292,7 +1293,7 @@ func statusIcon(s types.CommandStatus) string {
 		return "\u2713" // ✓
 	case types.StatusFailed:
 		return "\u2717" // ✗
-	case types.StatusRetrying:
+	case types.StatusFixing:
 		return "\u21bb" // ↻
 	default:
 		return "?"

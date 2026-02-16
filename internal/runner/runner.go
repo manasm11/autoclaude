@@ -136,16 +136,23 @@ func (r *Runner) executeFrom(startIndex int) {
 	r.sendAllDone()
 }
 
+// lastNLines returns the last n lines of s. If s has fewer than n lines, returns all of s.
+func lastNLines(s string, n int) string {
+	lines := strings.Split(s, "\n")
+	if len(lines) <= n {
+		return s
+	}
+	return strings.Join(lines[len(lines)-n:], "\n")
+}
+
 // executeSingle runs the full plan-execute-verify-commit cycle for a single command.
 // Returns true if the command succeeded, false if it permanently failed.
 func (r *Runner) executeSingle(i int, cmd *types.Command) bool {
-	success := false
-
 	// Accumulators for the current attempt's stdout/stderr across all steps.
 	var attemptStdout, attemptStderr strings.Builder
 
 	// finalizeAttempt fills in the terminal fields of an AttemptLog and appends it
-	// to cmd.AttemptLogs. It is called once per retry-loop iteration.
+	// to cmd.AttemptLogs. It is called once per attempt (initial or fix).
 	finalizeAttempt := func(log types.AttemptLog, failedStep string, exitCode int) {
 		log.FailedStep = failedStep
 		log.ExitCode = exitCode
@@ -175,73 +182,69 @@ func (r *Runner) executeSingle(i int, cmd *types.Command) bool {
 		last.Stderr = attemptStderr.String()
 	}
 
-	for cmd.Attempts < cmd.MaxRetries {
-		cmd.Attempts++
+	// recordFailure stores the most recent failure details on cmd for BuildFixPrompt().
+	recordFailure := func(failedStep string, exitCode int, stdout string, stderr string) {
+		cmd.LastFailedStep = failedStep
+		cmd.LastExitCode = exitCode
+		cmd.LastStdout = stdout
+		cmd.LastStderr = stderr
+	}
 
-		// Reset per-attempt accumulators.
-		attemptStdout.Reset()
-		attemptStderr.Reset()
-
-		// Initialize attempt log with pre-attempt context.
-		gitBranch, gitStatus := r.captureGitContext()
-		attemptLog := types.AttemptLog{
-			AttemptNumber: cmd.Attempts,
-			StartedAt:     time.Now(),
-			WorkDir:       r.WorkDir,
-			GitBranch:     gitBranch,
-			GitStatus:     gitStatus,
+	// sendFailed marks the command as failed and sends the failure report.
+	sendFailed := func() {
+		cmd.Status = types.StatusFailed
+		r.sendUpdate(i, types.StatusFailed, cmd.Output, "")
+		r.saveSession()
+		report := r.writeFailureReport(cmd)
+		if r.program != nil {
+			r.program.Send(ExecutionErrorMsg{
+				CmdIndex:      i,
+				Err:           fmt.Errorf("command failed after %d fix attempt(s)", cmd.FixAttempts),
+				FailureReport: report,
+			})
 		}
+	}
 
-		attemptDetail := fmt.Sprintf("Attempt %d/%d", cmd.Attempts, cmd.MaxRetries)
+	// --- Initial attempt context ---
+	attemptStdout.Reset()
+	attemptStderr.Reset()
+	cmd.Attempts = 1
 
-		// 1. PLANNING — skip if we already have a plan (e.g. resumed session)
-		if cmd.PlanOutput == "" {
-			cmd.Status = types.StatusPlanning
-			r.sendUpdate(i, types.StatusPlanning, "", attemptDetail)
-			r.saveSession()
+	gitBranch, gitStatus := r.captureGitContext()
+	attemptLog := types.AttemptLog{
+		AttemptNumber: 1,
+		StartedAt:     time.Now(),
+		WorkDir:       r.WorkDir,
+		GitBranch:     gitBranch,
+		GitStatus:     gitStatus,
+	}
 
-			planPrompt := "You are planning the implementation of a task. Create a detailed step-by-step implementation plan. List every file to create or modify, what exact changes to make in each file, function signatures, and edge cases to handle. Do NOT write any code, do NOT create or modify any files. Only output the plan in markdown.\n\nTask: " + cmd.Prompt
-			attemptLog.Command = "claude -p <planning prompt>"
-			planOutput, planResult, planErr := r.runClaude(i, planPrompt)
-			attemptStdout.WriteString(planResult.Stdout)
-			attemptStderr.WriteString(planResult.Stderr)
-			if planErr != nil {
-				finalizeAttempt(attemptLog, "Planning", planResult.ExitCode)
-				if cmd.Attempts < cmd.MaxRetries {
-					cmd.Output += planOutput
-					cmd.Output += fmt.Sprintf("\n═══ RETRY %d/%d ═══ (previous attempt failed at: Planning, exit code: %d)\n", cmd.Attempts+1, cmd.MaxRetries, planResult.ExitCode)
-					cmd.Status = types.StatusRetrying
-					r.sendUpdate(i, types.StatusRetrying, cmd.Output, attemptDetail)
-					r.saveSession()
-					select {
-					case <-time.After(2 * time.Second):
-					case <-r.ctx.Done():
-						return false
-					}
-					continue
-				}
-				cmd.Status = types.StatusFailed
-				cmd.Output += planOutput
-				r.sendUpdate(i, types.StatusFailed, cmd.Output, "")
-				r.saveSession()
-				report := r.writeFailureReport(cmd)
-				if r.program != nil {
-					r.program.Send(ExecutionErrorMsg{
-						CmdIndex:      i,
-						Err:           fmt.Errorf("command failed after %d attempt(s)", cmd.Attempts),
-						FailureReport: report,
-					})
-				}
-				return false
-			}
-			cmd.PlanOutput = planOutput
-			r.saveSession()
+	// 1. PLANNING — skip if we already have a plan (e.g. resumed session)
+	if cmd.PlanOutput == "" {
+		cmd.Status = types.StatusPlanning
+		r.sendUpdate(i, types.StatusPlanning, "", "")
+		r.saveSession()
+
+		planPrompt := "You are planning the implementation of a task. Create a detailed step-by-step implementation plan. List every file to create or modify, what exact changes to make in each file, function signatures, and edge cases to handle. Do NOT write any code, do NOT create or modify any files. Only output the plan in markdown.\n\nTask: " + cmd.Prompt
+		attemptLog.Command = "claude -p <planning prompt>"
+		planOutput, planResult, planErr := r.runClaude(i, planPrompt)
+		attemptStdout.WriteString(planResult.Stdout)
+		attemptStderr.WriteString(planResult.Stderr)
+		if planErr != nil {
+			finalizeAttempt(attemptLog, "Planning", planResult.ExitCode)
+			cmd.Output += planOutput
+			recordFailure("planning", planResult.ExitCode, planResult.Stdout, planResult.Stderr)
+			goto fixLoop
 		}
+		cmd.PlanOutput = planOutput
+		r.saveSession()
+	}
 
-		// 2. EXECUTION
+	// 2. EXECUTION
+	{
 		cmd.Status = types.StatusRunning
 		cmd.Output += "═══ PLAN ═══\n" + cmd.PlanOutput + "\n═══ EXECUTION ═══\n"
-		r.sendUpdate(i, types.StatusRunning, cmd.Output, attemptDetail)
+		r.sendUpdate(i, types.StatusRunning, cmd.Output, "")
 		r.saveSession()
 
 		execPrompt := "Execute the following implementation plan exactly. Follow each step precisely.\n\nPlan:\n" + cmd.PlanOutput + "\n\nOriginal task: " + cmd.Prompt
@@ -252,97 +255,117 @@ func (r *Runner) executeSingle(i int, cmd *types.Command) bool {
 		cmd.Output += execOutput
 
 		if execErr != nil {
-			cmd.PlanOutput = "" // fresh plan on retry
 			finalizeAttempt(attemptLog, "Running", execResult.ExitCode)
-			if cmd.Attempts < cmd.MaxRetries {
-				cmd.Output += fmt.Sprintf("\n═══ RETRY %d/%d ═══ (previous attempt failed at: Running, exit code: %d)\n", cmd.Attempts+1, cmd.MaxRetries, execResult.ExitCode)
-				cmd.Status = types.StatusRetrying
-				r.sendUpdate(i, types.StatusRetrying, cmd.Output, attemptDetail)
-				r.saveSession()
-				select {
-				case <-time.After(2 * time.Second):
-				case <-r.ctx.Done():
-					return false
-				}
-				continue
-			}
-			cmd.Status = types.StatusFailed
-			r.sendUpdate(i, types.StatusFailed, cmd.Output, "")
-			r.saveSession()
-			report := r.writeFailureReport(cmd)
-			if r.program != nil {
-				r.program.Send(ExecutionErrorMsg{
-					CmdIndex:      i,
-					Err:           fmt.Errorf("command failed after %d attempt(s)", cmd.Attempts),
-					FailureReport: report,
-				})
-			}
+			recordFailure("execution", execResult.ExitCode, execResult.Stdout, execResult.Stderr)
+			goto fixLoop
+		}
+	}
+
+	// 3. VERIFICATION
+	if cmd.Verify != "" {
+		cmd.Status = types.StatusVerifying
+		r.sendUpdate(i, types.StatusVerifying, cmd.Output, "")
+		r.saveSession()
+
+		attemptLog.Command = cmd.Verify
+		verifyOutput, verifyResult, verifyErr := r.runVerify(i, cmd.Verify)
+		attemptStdout.WriteString(verifyResult.Stdout)
+		attemptStderr.WriteString(verifyResult.Stderr)
+		cmd.Output += "\n" + verifyOutput
+
+		if verifyErr != nil {
+			finalizeAttempt(attemptLog, "Verifying", verifyResult.ExitCode)
+			recordFailure("verification", verifyResult.ExitCode, verifyResult.Stdout, verifyResult.Stderr)
+			goto fixLoop
+		}
+	}
+
+	// Initial attempt succeeded — log success.
+	finalizeAttempt(attemptLog, "", 0)
+	goto success
+
+fixLoop:
+	// Auto-fix loop: attempt to fix the failure and re-verify.
+	for {
+		cmd.FixAttempts++
+		if cmd.FixAttempts >= cmd.MaxRetries {
+			sendFailed()
 			return false
 		}
 
-		// 3. VERIFICATION
+		fixDetail := fmt.Sprintf("Fix %d/%d", cmd.FixAttempts, cmd.MaxRetries)
+
+		// Append fix separator to output.
+		cmd.Output += fmt.Sprintf("\n═══ FIX ATTEMPT %d/%d ═══\n", cmd.FixAttempts, cmd.MaxRetries)
+		cmd.Output += fmt.Sprintf("Failed step: %s | Exit code: %d\n", cmd.LastFailedStep, cmd.LastExitCode)
+		cmd.Output += fmt.Sprintf("Stderr: %s\n", lastNLines(cmd.LastStderr, 50))
+
+		cmd.Status = types.StatusFixing
+		r.sendUpdate(i, types.StatusFixing, cmd.Output, fixDetail)
+		r.saveSession()
+
+		// Sleep 2 seconds before fix attempt.
+		select {
+		case <-time.After(2 * time.Second):
+		case <-r.ctx.Done():
+			return false
+		}
+
+		// Reset per-attempt accumulators for the fix attempt.
+		attemptStdout.Reset()
+		attemptStderr.Reset()
+
+		gitBranch, gitStatus := r.captureGitContext()
+		fixAttemptLog := types.AttemptLog{
+			AttemptNumber: cmd.FixAttempts + 1, // +1 because attempt 1 is the initial try
+			StartedAt:     time.Now(),
+			WorkDir:       r.WorkDir,
+			GitBranch:     gitBranch,
+			GitStatus:     gitStatus,
+			Command:       "claude -p <auto-fix prompt>",
+		}
+
+		// Run claude with the fix prompt.
+		fixPrompt := cmd.BuildFixPrompt()
+		fixOutput, fixResult, _ := r.runClaude(i, fixPrompt)
+		attemptStdout.WriteString(fixResult.Stdout)
+		attemptStderr.WriteString(fixResult.Stderr)
+		cmd.Output += fmt.Sprintf("Fix output: %s\n", fixOutput)
+
+		// After fix, re-verify only (don't re-plan or re-execute).
 		if cmd.Verify != "" {
 			cmd.Status = types.StatusVerifying
-			r.sendUpdate(i, types.StatusVerifying, cmd.Output, attemptDetail)
+			r.sendUpdate(i, types.StatusVerifying, cmd.Output, fixDetail)
 			r.saveSession()
 
-			attemptLog.Command = cmd.Verify
 			verifyOutput, verifyResult, verifyErr := r.runVerify(i, cmd.Verify)
 			attemptStdout.WriteString(verifyResult.Stdout)
 			attemptStderr.WriteString(verifyResult.Stderr)
 			cmd.Output += "\n" + verifyOutput
 
 			if verifyErr != nil {
-				cmd.PlanOutput = "" // fresh plan on retry
-				finalizeAttempt(attemptLog, "Verifying", verifyResult.ExitCode)
-				if cmd.Attempts < cmd.MaxRetries {
-					cmd.Output += fmt.Sprintf("\n═══ RETRY %d/%d ═══ (previous attempt failed at: Verifying, exit code: %d)\n", cmd.Attempts+1, cmd.MaxRetries, verifyResult.ExitCode)
-					cmd.Status = types.StatusRetrying
-					r.sendUpdate(i, types.StatusRetrying, cmd.Output, attemptDetail)
-					r.saveSession()
-					select {
-					case <-time.After(2 * time.Second):
-					case <-r.ctx.Done():
-						return false
-					}
-					continue
-				}
-				cmd.Status = types.StatusFailed
-				r.sendUpdate(i, types.StatusFailed, cmd.Output, "")
-				r.saveSession()
-				report := r.writeFailureReport(cmd)
-				if r.program != nil {
-					r.program.Send(ExecutionErrorMsg{
-						CmdIndex:      i,
-						Err:           fmt.Errorf("command failed after %d attempt(s)", cmd.Attempts),
-						FailureReport: report,
-					})
-				}
-				return false
+				// Verification failed again — log this fix attempt and loop.
+				finalizeAttempt(fixAttemptLog, "auto-fix", verifyResult.ExitCode)
+				recordFailure("verification", verifyResult.ExitCode, verifyResult.Stdout, verifyResult.Stderr)
+				continue
+			}
+		} else {
+			// No verify command — assume fix succeeded if claude exited 0.
+			if fixResult.ExitCode != 0 {
+				finalizeAttempt(fixAttemptLog, "auto-fix", fixResult.ExitCode)
+				recordFailure("execution", fixResult.ExitCode, fixResult.Stdout, fixResult.Stderr)
+				continue
 			}
 		}
 
-		// Plan + execution + verify all passed — log success attempt.
-		finalizeAttempt(attemptLog, "", 0)
-		success = true
+		// Fix succeeded — log success attempt.
+		finalizeAttempt(fixAttemptLog, "", 0)
+		// Clear PlanOutput — the fix was applied directly, don't re-plan.
+		cmd.PlanOutput = ""
 		break
 	}
 
-	if !success {
-		cmd.Status = types.StatusFailed
-		r.sendUpdate(i, types.StatusFailed, cmd.Output, "")
-		r.saveSession()
-		report := r.writeFailureReport(cmd)
-		if r.program != nil {
-			r.program.Send(ExecutionErrorMsg{
-				CmdIndex:      i,
-				Err:           fmt.Errorf("command failed after %d attempt(s)", cmd.Attempts),
-				FailureReport: report,
-			})
-		}
-		return false
-	}
-
+success:
 	// 4. DOCUMENTATION (non-fatal)
 	if !r.NoDocs {
 		cmd.Status = types.StatusDocumenting

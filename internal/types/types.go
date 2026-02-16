@@ -205,6 +205,7 @@ type SessionCommand struct {
 	MaxRetries  int                 `json:"max_retries"`
 	Status      string              `json:"status"`
 	Attempts    int                 `json:"attempts"`
+	FixAttempts int                 `json:"fix_attempts,omitempty"`
 	Output      string              `json:"output,omitempty"`
 	PlanOutput  string              `json:"plan_output,omitempty"`
 	AttemptLogs []SessionAttemptLog `json:"attempt_logs,omitempty"`
@@ -235,6 +236,7 @@ func (c *Command) ToSessionCommand() SessionCommand {
 		MaxRetries:  c.MaxRetries,
 		Status:      c.Status.String(),
 		Attempts:    c.Attempts,
+		FixAttempts: c.FixAttempts,
 		Output:      c.Output,
 		PlanOutput:  c.PlanOutput,
 		AttemptLogs: sessionLogs,
@@ -268,6 +270,7 @@ func FromSessionCommand(sc SessionCommand) *Command {
 		MaxRetries:  sc.MaxRetries,
 		Status:      ParseCommandStatus(sc.Status),
 		Attempts:    sc.Attempts,
+		FixAttempts: sc.FixAttempts,
 		Output:      sc.Output,
 		PlanOutput:  sc.PlanOutput,
 		AttemptLogs: logs,
