@@ -129,7 +129,7 @@ type Model struct {
 	resumeSession  *session.SessionState // detected previous session (nil if none)
 	resumeIndex    int                   // index where execution would resume from
 	autoResume     bool                  // auto-resume without TUI prompt (--auto-run)
-	resetAttempts  bool                  // --reset-attempts: reset retry budget on resume
+	resetAttempts  bool                  // --reset-attempts: reset fix attempt budget on resume
 	failureReport    string // Full failure report text from runner
 	failedCmdIndex   int    // Index of the failed command (-1 if none)
 	showExpandedLog  bool   // 'l' toggle: show all attempts' full stdout/stderr
@@ -208,7 +208,7 @@ func (m *Model) SetAutoResume(sess *session.SessionState, resumeIndex int) {
 	m.autoResume = true
 }
 
-// SetResetAttempts configures the model to reset attempt counters on resume, giving a full fresh retry budget.
+// SetResetAttempts configures the model to reset attempt counters on resume, giving a full fresh fix attempt budget.
 func (m *Model) SetResetAttempts() {
 	m.resetAttempts = true
 }
@@ -280,7 +280,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		sess := m.resumeSession
 		cmds := session.ToCommands(sess)
 
-		// Reset the resume-from command to pending, preserving retry budget
+		// Reset the resume-from command to pending, preserving fix attempt budget
 		if m.resumeIndex < len(cmds) {
 			cmds[m.resumeIndex].Status = types.StatusPending
 			if m.resetAttempts {

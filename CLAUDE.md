@@ -45,19 +45,17 @@ go test ./...
 
 ### Auto-fix mechanism (internal/runner/runner.go)
 
-The old retry-from-planning loop has been replaced with an auto-fix system. On failure, Claude analyzes the error and makes targeted code fixes, then only re-runs verification (not the full plan+execute cycle).
+On failure, Claude analyzes the error and makes targeted code fixes, then only re-runs verification (not the full plan+execute cycle).
 
 #### Type-level support (internal/types/types.go)
 
-- **`StatusFixing`** (iota 9): Command status for when Claude is auto-fixing a failure. Appended after `StatusRetrying` — no existing iota values shift.
+- **`StatusFixing`** (iota 8): Command status for when Claude is auto-fixing a failure.
 - **`AutoFix` field on `Command`**: `bool`, default `true`. When `false`, any failure at Planning/Running/Verifying goes directly to `StatusFailed` without entering the fix loop. Set via TOML config (`auto_fix`), `NewCommand()` default, or CLI `--no-auto-fix` override. Persisted in `SessionCommand` as `*bool` (JSON key: `auto_fix`, `omitempty`) — `nil` on deserialization from old session files defaults to `true`.
 - **Auto-fix fields on `Command`**: `LastFailedStep` (string: `"planning"`, `"execution"`, or `"verification"`), `LastExitCode` (int), `LastStderr`/`LastStdout` (string), `FixAttempts` (int counter). These track the most recent failure and are replaced (not accumulated) on each failure. Zero values mean "no failure recorded". All five fields are persisted in `SessionCommand` (JSON keys: `last_failed_step`, `last_exit_code`, `last_stderr`, `last_stdout`, `fix_attempts`) so that session resume restores fix state correctly. Old session files missing these keys deserialize to zero values, which is the correct "no failure recorded" semantic.
 - **`BuildFixPrompt()`**: Method on `*Command` that constructs a prompt for Claude to fix the issue. Includes: original task prompt, failed step, exit code, plan (if available), stdout, stderr, and a clear instruction to make targeted fixes. Conditionally omits empty sections (PlanOutput, LastStdout, LastStderr).
-- **`StatusRetrying`** is still present in the iota block and `String()` labels for backward compatibility (preserves iota values so `StatusFixing = 9`). Removed from `ParseCommandStatus()` — old sessions with `"Retrying"` status now deserialize to `StatusPending` (the default case), causing them to restart from the beginning on resume.
-
 #### Runner auto-fix flow (internal/runner/runner.go)
 
-- **`executeSingle` structure**: Linear initial attempt (plan → execute → verify) followed by a `fixLoop:` label for auto-fix iterations. Uses `goto fixLoop` from three failure points (planning, execution, verification) and `goto success` when the initial attempt passes. No retry loop wrapping the initial attempt.
+- **`executeSingle` structure**: Linear initial attempt (plan → execute → verify) followed by a `fixLoop:` label for auto-fix iterations. Uses `goto fixLoop` from three failure points (planning, execution, verification) and `goto success` when the initial attempt passes. No loop wrapping the initial attempt.
 - **Auto-fix guard**: At each of the three `goto fixLoop` sites, `cmd.AutoFix` is checked first. If `false`, calls `sendFailed()` and returns immediately — the fix loop is never entered.
 - **`recordFailure` closure**: Populates `cmd.LastFailedStep`, `cmd.LastExitCode`, `cmd.LastStdout`, `cmd.LastStderr` before entering the fix loop. These fields are read by `cmd.BuildFixPrompt()`.
 - **`sendFailed` closure**: Encapsulates the failure path — sets `StatusFailed`, saves session, writes failure report, sends `ExecutionErrorMsg`.
@@ -84,10 +82,10 @@ The old retry-from-planning loop has been replaced with an auto-fix system. On f
 - **`ExecutionErrorMsg`** carries `FailureReport string` alongside `CmdIndex` and `Err`. Sent from `sendFailed` closure when fix attempts are exhausted.
 - The TUI stores `failureReport`, `failedCmdIndex`, `showExpandedLog`, and `failureScrollOff` on `Model`. The failure panel (`viewFailurePanel()`) shows command info + scrollable last-attempt stderr (compact) or full report (expanded via `l` key). Scroll is separate from the main output scroll (`failureScrollOff` vs `scrollOffset`).
 
-### Session resume and retry budget (internal/tui/model.go)
+### Session resume and fix attempt budget (internal/tui/model.go)
 
-- **Retry budget preservation on resume**: When resuming a session, the `resumeRunMsg` handler sets `Attempts = len(AttemptLogs)` for the resume-from command. This ensures the retry budget accounts for previous attempts — if a command used 2/3 attempts before interruption, it only gets 1 more on resume.
-- **`--reset-attempts` flag**: `Model.resetAttempts` (set via `SetResetAttempts()`). When true, the resume handler clears `Attempts`, `FixAttempts`, `AttemptLogs`, and all `Last*` fields (`LastFailedStep`, `LastExitCode`, `LastStderr`, `LastStdout`) to give a full fresh retry budget and clean failure context. All must be cleared together for consistency — stale failure context would confuse `BuildFixPrompt()` and the TUI's enhanced fixing view.
+- **Fix attempt budget preservation on resume**: When resuming a session, the `resumeRunMsg` handler sets `Attempts = len(AttemptLogs)` for the resume-from command. This ensures the fix attempt budget accounts for previous attempts — if a command used 2/3 attempts before interruption, it only gets 1 more on resume.
+- **`--reset-attempts` flag**: `Model.resetAttempts` (set via `SetResetAttempts()`). When true, the resume handler clears `Attempts`, `FixAttempts`, `AttemptLogs`, and all `Last*` fields (`LastFailedStep`, `LastExitCode`, `LastStderr`, `LastStdout`) to give a full fresh fix attempt budget and clean failure context. All must be cleared together for consistency — stale failure context would confuse `BuildFixPrompt()` and the TUI's enhanced fixing view.
 - **Resume view attempt history**: `viewResume()` shows `(N/M attempts used)` in `helpStyle` for non-success commands that have attempt logs.
 - **Flag wiring** (`main.go`): `--reset-attempts` is a `flag.BoolVar`, passed to the TUI via `model.SetResetAttempts()` inside the `if resumeSession != nil` block. No-op if no session exists.
 

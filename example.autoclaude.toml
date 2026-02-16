@@ -11,7 +11,7 @@
 # Global settings
 # ---------------------------------------------------------------------------
 
-# Maximum retry attempts per command (default: 3).
+# Maximum fix attempts per command (default: 3).
 # Individual commands can override this with their own max_retries.
 max_retries = 5
 
@@ -31,12 +31,12 @@ prompt = "Add comprehensive error handling to the API layer"
 
 # A command with a shell verification step.
 # After Claude finishes, the verify command runs.  If it exits non-zero the
-# command is retried (up to the global max_retries).
+# command is auto-fixed (up to the global max_retries).
 [[command]]
 prompt = "Write unit tests for the user authentication module"
 verify = "go test ./internal/auth/..."
 
-# A command with its own retry limit that overrides the global value.
+# A command with its own fix attempt limit that overrides the global value.
 [[command]]
 prompt = "Refactor the database connection pool for better concurrency"
 verify = "go test -race ./internal/db/..."

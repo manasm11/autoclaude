@@ -48,7 +48,7 @@ Flags:
   -w, --work-dir string   Working directory (default: current directory)
   -a, --auto-run          Skip TUI queue review and start execution immediately
   -R, --no-resume         Skip session detection and start fresh (clears any existing session)
-      --reset-attempts    Reset attempt counters on resume (gives full retry budget)
+      --reset-attempts    Reset attempt counters on resume (gives full fix attempt budget)
       --no-docs           Skip automatic documentation update step
       --no-auto-fix       Disable auto-fix on failure (fail immediately)
       --clear-session     Delete any existing session file and exit
@@ -110,7 +110,7 @@ func main() {
 	flag.StringVar(&workDir, "work-dir", "", "working directory for command execution (defaults to current directory)")
 	flag.BoolVar(&autoRun, "auto-run", false, "skip TUI queue review and start execution immediately")
 	flag.BoolVar(&noResume, "no-resume", false, "skip session detection and start fresh")
-	flag.BoolVar(&resetAttempts, "reset-attempts", false, "reset attempt counters on resume (gives full retry budget)")
+	flag.BoolVar(&resetAttempts, "reset-attempts", false, "reset attempt counters on resume (gives full fix attempt budget)")
 	flag.BoolVar(&noDocs, "no-docs", false, "skip automatic documentation update step")
 	flag.BoolVar(&noAutoFix, "no-auto-fix", false, "disable auto-fix on failure (fail immediately)")
 	flag.BoolVar(&clearSession, "clear-session", false, "delete any existing session file and exit")

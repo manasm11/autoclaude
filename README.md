@@ -97,19 +97,19 @@ verify = "go test -race ./internal/db/..."
 max_retries = 10
 
 [[command]]
-prompt = "Quick one-shot task that should not retry"
+prompt = "Quick one-shot task that should not auto-fix"
 auto_fix = false  # fail immediately on error, no fix attempts
 ```
 
 | Field | Scope | Required | Default | Description |
 |-------|-------|----------|---------|-------------|
-| `max_retries` | global | no | `3` | Default retry limit for all commands |
+| `max_retries` | global | no | `3` | Default fix attempt limit for all commands |
 | `work_dir` | global | no | current dir | Working directory for execution |
 | `update_docs` | global | no | `true` | Auto-update CLAUDE.md and README.md after each command |
 | `auto_fix` | global | no | `true` | Auto-fix failures using Claude (set `false` to fail immediately) |
 | `prompt` | command | **yes** | — | The Claude Code prompt to run |
 | `verify` | command | no | — | Shell command to verify success (exit 0 = pass) |
-| `max_retries` | command | no | global value | Per-command retry override |
+| `max_retries` | command | no | global value | Per-command fix attempt limit override |
 | `auto_fix` | command | no | global value | Per-command auto-fix override |
 
 See [`example.autoclaude.toml`](example.autoclaude.toml) for a fully commented example.
@@ -161,11 +161,11 @@ autoclaude -c "Fix the bug::go test ./..." --auto-run
 |-------|------|------|---------|-------------|
 | `-f` | `--file` | string | — | Path to a TOML config file |
 | `-c` | `--cmd` | string | — | Prompt to run (repeatable). Format: `"prompt"` or `"prompt::verify"` |
-| `-r` | `--max-retries` | int | `3` | Maximum retries per command |
+| `-r` | `--max-retries` | int | `3` | Maximum fix attempts per command |
 | `-w` | `--work-dir` | string | current dir | Working directory for execution |
 | `-a` | `--auto-run` | bool | `false` | Skip TUI review, start immediately |
 | `-R` | `--no-resume` | bool | `false` | Skip session detection and start fresh |
-| | `--reset-attempts` | bool | `false` | Reset attempt counters on resume (gives full retry budget) |
+| | `--reset-attempts` | bool | `false` | Reset attempt counters on resume (gives full fix attempt budget) |
 | | `--no-docs` | bool | `false` | Skip automatic documentation update step |
 | | `--no-auto-fix` | bool | `false` | Disable auto-fix on failure (fail immediately) |
 | | `--clear-session` | bool | `false` | Delete any existing session file and exit |
@@ -193,7 +193,7 @@ Pending → Planning → Running → Verifying → Documenting → Committing �
 | **Success** | Command completed and changes were committed |
 | **Failed** | All fix attempts exhausted — execution stops |
 
-### Retry and auto-fix behavior
+### Auto-fix behavior
 
 When a command fails at the planning, execution, or verification step, autoclaude can automatically attempt to fix the issue using Claude. The auto-fix flow works like this:
 
@@ -204,7 +204,7 @@ When a command fails at the planning, execution, or verification step, autoclaud
 
 Key details:
 
-- `max_retries` means **total attempts**, not additional retries. `max_retries = 3` means the command gets at most 3 chances (1 initial + 2 fix attempts).
+- `max_retries` means **total attempts**, not additional fix attempts. `max_retries = 3` means the command gets at most 3 chances (1 initial + 2 fix attempts).
 - Each fix attempt is preceded by a 2-second cooldown.
 - **Documenting** and **Committing** failures are non-fatal and never trigger fix attempts — the command still succeeds.
 - Each command tracks its own attempt count against its `max_retries` limit.
@@ -245,7 +245,7 @@ The `--no-auto-fix` flag takes priority over all TOML `auto_fix` settings, match
 
 ### Attempt logging
 
-Each retry attempt is recorded in a detailed attempt log capturing:
+Each attempt is recorded in a detailed attempt log capturing:
 
 - Timing (start, end, duration)
 - Which step failed (Planning, Running, Verifying, etc.)
@@ -325,9 +325,9 @@ Resuming previous session from command 3/5
 
 ### Resetting attempt counters
 
-When resuming a session, autoclaude preserves the full retry and fix state from the previous run. If a command used 2 of its 3 fix attempts before the session was interrupted, it will only get 1 more fix attempt on resume. The failure context (which step failed, exit code, stdout/stderr) is also preserved, so if the command fails again on resume, the auto-fix prompt has accurate context from the previous failure. The resume screen shows this: `(2/3 attempts used)`.
+When resuming a session, autoclaude preserves the full fix attempt state from the previous run. If a command used 2 of its 3 fix attempts before the session was interrupted, it will only get 1 more fix attempt on resume. The failure context (which step failed, exit code, stdout/stderr) is also preserved, so if the command fails again on resume, the auto-fix prompt has accurate context from the previous failure. The resume screen shows this: `(2/3 attempts used)`.
 
-If you've manually fixed an issue and want to give the command a full fresh retry budget, use `--reset-attempts`:
+If you've manually fixed an issue and want to give the command a full fresh fix attempt budget, use `--reset-attempts`:
 
 ```sh
 autoclaude --reset-attempts
@@ -381,7 +381,7 @@ autoclaude.refactor.toml # refactoring batch
 
 ## Failure logging
 
-When a command permanently fails (all retry attempts exhausted), autoclaude writes a detailed failure report to `autoclaude-error.log` in the working directory. The file is append-only — each failure adds a timestamped entry, so logs accumulate across runs.
+When a command permanently fails (all fix attempts exhausted), autoclaude writes a detailed failure report to `autoclaude-error.log` in the working directory. The file is append-only — each failure adds a timestamped entry, so logs accumulate across runs.
 
 Each entry includes:
 - Timestamp and command prompt

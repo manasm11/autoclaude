@@ -1,255 +1,263 @@
-# Implementation Plan: Auto-Fix Configuration Options
+# Plan: Remove old retry mechanism and clean up codebase
 
-## Overview
+## Summary
 
-Add a configurable `auto_fix` option that controls whether the auto-fix loop runs on failure. Can be set globally in TOML config, overridden per-command, or disabled via CLI flag `--no-auto-fix`. When disabled, any failure at Planning/Running/Verifying goes directly to `StatusFailed` without entering the fix loop.
+Remove `StatusRetrying` from the codebase entirely, update all "retry" wording in user-facing strings to "fix attempt" / "auto-fix", and update documentation (CLAUDE.md and README.md) to consistently describe the auto-fix behavior. The `max_retries` TOML/flag/field name stays the same to avoid breaking configs.
 
 ---
 
-## File Changes
+## Step 1: Remove `StatusRetrying` from `internal/types/types.go`
 
-### 1. `internal/config/config.go`
+### 1a. Remove the iota constant
 
-**Add `AutoFix *bool` to both config structs:**
+**Problem:** `StatusRetrying` (iota 8) exists solely for backward compatibility, but removing it shifts `StatusFixing` from 9 to 8. This is safe because:
+- `StatusRetrying` is not used anywhere in Go code (no switch cases, no TUI rendering, no runner logic reference it)
+- Session files store status as a *string* (`"Fixing"`, `"Failed"`, etc.), not as an integer — the iota value doesn't matter for deserialization
+- `ParseCommandStatus()` already doesn't handle `"Retrying"` — it falls through to `StatusPending`
 
-- Add `AutoFix *bool \`toml:"auto_fix"\`` to `ConfigCommand` struct (after `MaxRetries` on line 16)
-- Add `AutoFix *bool \`toml:"auto_fix"\`` to `ConfigFile` struct (after `UpdateDocs` on line 23)
+**Changes in the const block (line 12-23):**
+- Remove line 21: `StatusRetrying                        // 8`
+- `StatusFixing` will now become iota 8 (was 9). This is safe since no code depends on the numeric value.
 
-Using `*bool` (pointer) allows distinguishing "not set" (`nil`) from "explicitly set to false" — same pattern as the existing `UpdateDocs *bool`.
-
-**Modify `ToCommands()` (lines 77-92) — resolve per-command override:**
-
-In the loop body, after determining `retries` (line 80-83), add logic to resolve the `AutoFix` boolean:
-
-```
-autoFix := true                           // default
-if cfg.AutoFix != nil {
-    autoFix = *cfg.AutoFix                // global override
-}
-if cc.AutoFix != nil {
-    autoFix = *cc.AutoFix                 // per-command override wins
-}
-```
-
-Add `AutoFix: autoFix` to the `&types.Command{...}` literal (line 84-89).
-
-### 2. `internal/types/types.go`
-
-**Add `AutoFix bool` to `Command` struct (lines 62-76):**
-
-- Add `AutoFix bool` field after `FixAttempts` (line 75). Comment: `// whether auto-fix is enabled (default true)`
-- Plain `bool`, not `*bool` — by the time it reaches `Command`, the tri-state resolution is done.
-
-**Update `NewCommand()` (lines 79-84):**
-
-- Add `AutoFix: true` to the returned `&Command{...}` literal. This ensures commands created via `-c` CLI flags (which bypass TOML) default to auto-fix enabled.
-
-**Add `AutoFix` to `SessionCommand` (lines 200-214):**
-
-- Add `AutoFix *bool \`json:"auto_fix,omitempty"\`` field after `FixAttempts` (line 206).
-- Using `*bool` (not plain `bool`) for session persistence. Reason: Go's `json.Unmarshal` sets missing `bool` fields to `false`, but we want the default to be `true`. With `*bool`, a missing key deserializes to `nil`, which we can detect and default to `true`.
-
-**Update `ToSessionCommand()` (lines 217-250):**
-
-- Create a local: `autoFix := c.AutoFix`
-- Add `AutoFix: &autoFix` to the returned `SessionCommand{...}` literal (after `FixAttempts` on line 241).
-
-**Update `FromSessionCommand()` (lines 253-288):**
-
-- Resolve the `*bool` to `bool` with default `true`:
-  ```
-  autoFix := true
-  if sc.AutoFix != nil {
-      autoFix = *sc.AutoFix
-  }
-  ```
-- Add `AutoFix: autoFix` to the returned `&Command{...}` literal (after `FixAttempts` on line 279).
-
-**Edge case — old session files:** Missing `auto_fix` key → `sc.AutoFix` is `nil` → defaults to `true`. Correct behavior: old sessions get auto-fix enabled.
-
-### 3. `internal/runner/runner.go`
-
-**Modify `executeSingle()` — guard the three `goto fixLoop` jumps:**
-
-At each of the three `goto fixLoop` sites, add a check that skips the fix loop when auto-fix is disabled:
-
-**Line 237 (planning failure):**
+After:
 ```go
-// Before:
-goto fixLoop
-
-// After:
-if !cmd.AutoFix {
-    sendFailed()
-    return false
-}
-goto fixLoop
+const (
+    StatusPending    CommandStatus = iota // 0
+    StatusPlanning                        // 1
+    StatusRunning                         // 2
+    StatusVerifying                       // 3
+    StatusDocumenting                     // 4
+    StatusCommitting                      // 5
+    StatusSuccess                         // 6
+    StatusFailed                          // 7
+    StatusFixing                          // 8
+)
 ```
 
-**Line 260 (execution failure):**
-Same pattern — add `if !cmd.AutoFix { sendFailed(); return false }` before `goto fixLoop`.
+### 1b. Remove "Retrying" from the `String()` labels slice
 
-**Line 279 (verification failure):**
-Same pattern — add `if !cmd.AutoFix { sendFailed(); return false }` before `goto fixLoop`.
+**Changes in `String()` method (line 27-43):**
+- Remove line 36: `"Retrying",`
+- The labels slice becomes: `["Pending", "Planning", "Running", "Verifying", "Documenting", "Committing", "Success", "Failed", "Fixing"]`
 
-No changes to the fix loop itself — if `AutoFix` is false, we never enter it. The `sendFailed()` closure already handles StatusFailed, session save, failure report, and `ExecutionErrorMsg`.
-
-### 4. `main.go`
-
-**Add `noAutoFix` flag variable (lines 91-102):**
-
-- Add `noAutoFix bool` to the `var` block (after `noDocs` on line 99).
-
-**Register the flag (lines 104-123):**
-
-- Add after line 112 (`--no-docs`):
-  ```go
-  flag.BoolVar(&noAutoFix, "no-auto-fix", false, "disable auto-fix on failure (fail immediately)")
-  ```
-- No short alias — consistent with `--no-docs`, `--reset-attempts`, `--clear-session`.
-
-**Update `usage()` function (lines 33-63):**
-
-- Add to the Flags section after `--no-docs` (line 52):
-  ```
-        --no-auto-fix       Disable auto-fix — fail immediately without fix attempts
-  ```
-
-**Apply `--no-auto-fix` to commands (after line 268):**
-
-Add a new step after the existing "Apply global --max-retries" step:
-
+After:
 ```go
-// 5. Apply --no-auto-fix globally
-if noAutoFix {
-    for _, cmd := range commands {
-        cmd.AutoFix = false
+func (s CommandStatus) String() string {
+    labels := []string{
+        "Pending",
+        "Planning",
+        "Running",
+        "Verifying",
+        "Documenting",
+        "Committing",
+        "Success",
+        "Failed",
+        "Fixing",
     }
+    ...
 }
 ```
 
-Renumber the existing step 5 ("Validate --auto-run requires commands") to step 6.
+### 1c. No changes needed to `ParseCommandStatus()`
 
-**Precedence logic:**
-- TOML per-command `auto_fix` is resolved in `ToCommands()`.
-- CLI `-c` commands get `AutoFix: true` from `NewCommand()`.
-- `--no-auto-fix` flag overrides ALL commands (loops through and sets `false`).
-- This matches the `--no-docs` pattern: CLI flag wins over TOML config.
-
-### 5. `internal/config/init.go`
-
-**Update `sampleConfig` constant (lines 9-37):**
-
-Add a commented-out `auto_fix` line in the global settings section, after the `update_docs` comment (line 16):
-
-```
-# auto_fix = true  # auto-fix failures using Claude (default: true)
-```
-
-### 6. `README.md`
-
-**Update Config file format example TOML block (lines 80-97):**
-
-Add a commented-out `auto_fix` line in the global settings area:
-
-```toml
-# auto_fix = true  # auto-fix failures (default: true, set false to fail immediately)
-```
-
-**Update Config file format table (lines 99-107):**
-
-Add two new rows after the `update_docs` row:
-
-| `auto_fix` | global | no | `true` | Enable auto-fix: feed errors back to Claude for targeted fixes |
-| `auto_fix` | command | no | global value | Per-command auto-fix override |
-
-**Update Flag reference table (lines 153-164):**
-
-Add a new row after `--no-docs`:
-
-| | `--no-auto-fix` | bool | `false` | Disable auto-fix — fail immediately without fix attempts |
-
-**Update "Retry and auto-fix behavior" section (lines 188-198):**
-
-Add a bullet point explaining the `auto_fix` option:
-
-```
-- `auto_fix` controls whether the auto-fix loop runs on failure. Set to `false` globally
-  or per-command in TOML, or use `--no-auto-fix` on the CLI. When disabled, any failure
-  goes directly to Failed — `max_retries` is ignored and the command gets exactly one attempt.
-```
+`ParseCommandStatus()` (line 160-183) already does NOT have a case for `"Retrying"` — unrecognized values fall through to `StatusPending`. No change needed.
 
 ---
 
-## Files NOT Modified
+## Step 2: Update "retry" wording in Go source files
 
-| File | Reason |
-|------|--------|
-| `internal/tui/model.go` | `AutoFix` is a config setting, not execution state. The `--reset-attempts` handler should NOT reset it. The TUI displays fix state correctly via existing `StatusFixing` / `FixAttempts` logic — no changes needed. |
-| `internal/session/session.go` | Thin persistence layer. All field additions are in `types` package. Session functions work generically over structs. |
-| `internal/runner/runner.go` (Runner struct) | No new fields on `Runner`. `AutoFix` lives on each `Command`, not on the runner. |
+### 2a. `internal/tui/model.go`
+
+Three comments contain "retry" wording that should be updated:
+
+1. **Line 132** — Field comment on `resetAttempts`:
+   - Old: `// --reset-attempts: reset retry budget on resume`
+   - New: `// --reset-attempts: reset fix attempt budget on resume`
+
+2. **Line 211** — `SetResetAttempts()` doc comment:
+   - Old: `// SetResetAttempts configures the model to reset attempt counters on resume, giving a full fresh retry budget.`
+   - New: `// SetResetAttempts configures the model to reset attempt counters on resume, giving a full fresh fix attempt budget.`
+
+3. **Line 283** — Comment in `resumeRunMsg` handler:
+   - Old: `// Reset the resume-from command to pending, preserving retry budget`
+   - New: `// Reset the resume-from command to pending, preserving fix attempt budget`
+
+### 2b. `main.go`
+
+Two user-facing strings contain "retry":
+
+1. **Line 51** — Usage text for `--reset-attempts`:
+   - Old: `      --reset-attempts    Reset attempt counters on resume (gives full retry budget)`
+   - New: `      --reset-attempts    Reset attempt counters on resume (gives full fix attempt budget)`
+
+2. **Line 113** — `flag.BoolVar` description for `--reset-attempts`:
+   - Old: `flag.BoolVar(&resetAttempts, "reset-attempts", false, "reset attempt counters on resume (gives full retry budget)")`
+   - New: `flag.BoolVar(&resetAttempts, "reset-attempts", false, "reset attempt counters on resume (gives full fix attempt budget)")`
+
+### 2c. `internal/config/init.go`
+
+1. **Line 35** — Sample config prompt text:
+   - Old: `prompt = "Describe a task with custom retry limit."`
+   - New: `prompt = "Describe a task with custom fix attempt limit."`
 
 ---
 
-## Data Flow Summary
+## Step 3: Update `example.autoclaude.toml`
 
+1. **Line 14** — Comment:
+   - Old: `# Maximum retry attempts per command (default: 3).`
+   - New: `# Maximum fix attempts per command (default: 3).`
+
+2. **Line 15** — stays the same (references `max_retries` which is the TOML key name, not user-facing wording)
+
+3. **Line 33-34** — Comment about retrying:
+   - Old: `# command is retried (up to the global max_retries).`
+   - New: `# command triggers auto-fix attempts (up to the global max_retries).`
+
+4. **Line 39** — Comment:
+   - Old: `# A command with its own retry limit that overrides the global value.`
+   - New: `# A command with its own fix attempt limit that overrides the global value.`
+
+---
+
+## Step 4: Update `README.md`
+
+### 4a. Config table description (line 100)
+
+- Old: `prompt = "Quick one-shot task that should not retry"`
+- New: `prompt = "Quick one-shot task that should not auto-fix"`
+
+### 4b. Config table field descriptions (lines 106, 112)
+
+1. **Line 106:**
+   - Old: `| `max_retries` | global | no | `3` | Default retry limit for all commands |`
+   - New: `| `max_retries` | global | no | `3` | Default fix attempt limit for all commands |`
+
+2. **Line 112:**
+   - Old: `| `max_retries` | command | no | global value | Per-command retry override |`
+   - New: `| `max_retries` | command | no | global value | Per-command fix attempt limit override |`
+
+### 4c. Flag reference table (line 168)
+
+- Old: `| | `--reset-attempts` | bool | `false` | Reset attempt counters on resume (gives full retry budget) |`
+- New: `| | `--reset-attempts` | bool | `false` | Reset attempt counters on resume (gives full fix attempt budget) |`
+
+### 4d. Section heading (line 196)
+
+- Old: `### Retry and auto-fix behavior`
+- New: `### Auto-fix behavior`
+
+### 4e. Attempt logging section (line 248)
+
+- Old: `Each retry attempt is recorded in a detailed attempt log capturing:`
+- New: `Each attempt (initial + fix attempts) is recorded in a detailed attempt log capturing:`
+
+### 4f. Session resume section (line 328)
+
+- Old: `When resuming a session, autoclaude preserves the full retry and fix state from the previous run.`
+- New: `When resuming a session, autoclaude preserves the full fix attempt state from the previous run.`
+
+### 4g. Reset attempts section (line 330)
+
+- Old: `If you've manually fixed an issue and want to give the command a full fresh retry budget, use `--reset-attempts`:`
+- New: `If you've manually fixed an issue and want to give the command a full fresh fix attempt budget, use `--reset-attempts`:`
+
+### 4h. Failure logging section (line 384)
+
+- Old: `When a command permanently fails (all retry attempts exhausted), autoclaude writes a detailed failure report`
+- New: `When a command permanently fails (all fix attempts exhausted), autoclaude writes a detailed failure report`
+
+---
+
+## Step 5: Update `CLAUDE.md`
+
+### 5a. StatusRetrying references
+
+1. **Line 52** — Remove mention of StatusRetrying:
+   - Old: `- **`StatusFixing`** (iota 9): Command status for when Claude is auto-fixing a failure. Appended after `StatusRetrying` — no existing iota values shift.`
+   - New: `- **`StatusFixing`** (iota 8): Command status for when Claude is auto-fixing a failure.`
+
+2. **Line 56** — Remove entire bullet about StatusRetrying:
+   - Old: `- **`StatusRetrying`** is still present in the iota block and `String()` labels for backward compatibility...`
+   - **Delete this entire line/bullet.**
+
+### 5b. "retry" wording in CLAUDE.md
+
+1. **Line 48:**
+   - Old: `The old retry-from-planning loop has been replaced with an auto-fix system. On failure, Claude analyzes the error and makes targeted code fixes, then only re-runs verification (not the full plan+execute cycle).`
+   - New: `On failure, Claude analyzes the error and makes targeted code fixes, then only re-runs verification (not the full plan+execute cycle).`
+
+2. **Line 60** — Comment mentions "No retry loop":
+   - Old: `No retry loop wrapping the initial attempt.`
+   - New: `No loop wrapping the initial attempt.`
+
+3. **Line 87** — Section heading:
+   - Old: `### Session resume and retry budget (internal/tui/model.go)`
+   - New: `### Session resume and fix attempt budget (internal/tui/model.go)`
+
+4. **Line 89:**
+   - Old: `- **Retry budget preservation on resume**:`
+   - New: `- **Fix attempt budget preservation on resume**:`
+   - Also in same line: `This ensures the retry budget accounts for` → `This ensures the fix attempt budget accounts for`
+
+5. **Line 90:**
+   - Old: `...to give a full fresh retry budget and clean failure context.`
+   - New: `...to give a full fresh fix attempt budget and clean failure context.`
+
+---
+
+## Step 6: Run verification commands
+
+```sh
+go mod tidy
+go vet ./...
+go build ./...
 ```
-TOML file:
-  auto_fix = false           →  ConfigFile.AutoFix = ptr(false)
-  [[command]]
-    auto_fix = true          →  ConfigCommand.AutoFix = ptr(true)
 
-config.ToCommands():
-  per-command ptr(true) wins →  Command.AutoFix = true
-
-CLI --no-auto-fix:
-  overrides all commands     →  Command.AutoFix = false
-
-CLI -c "prompt":
-  NewCommand() default       →  Command.AutoFix = true
-
-Session round-trip:
-  Command.AutoFix (bool)     →  SessionCommand.AutoFix (*bool, non-nil)
-  SessionCommand.AutoFix     →  Command.AutoFix (bool, nil defaults to true)
-
-Runner executeSingle():
-  if !cmd.AutoFix → sendFailed() immediately, skip fixLoop
-```
+These confirm no compile errors, unused imports, or dead code were introduced.
 
 ---
 
-## Edge Cases
+## Step 7: Review — files NOT changed (and why)
 
-1. **Old session files missing `auto_fix` key**: `SessionCommand.AutoFix` is `*bool`. Missing key → `nil` → `FromSessionCommand()` defaults to `true`. Correct.
+### `internal/runner/runner.go`
+- Contains NO references to `StatusRetrying` or "retry" wording in comments/strings. `MaxRetries` field name stays. No changes needed.
 
-2. **`--no-auto-fix` with `--reset-attempts`**: Independent. `--no-auto-fix` sets `AutoFix=false` during loading. `--reset-attempts` clears attempt counters on resume. No conflict.
+### `internal/session/session.go`
+- Contains NO references to `StatusRetrying` or "retry" wording. `MaxRetries` JSON key stays. No changes needed.
 
-3. **`--no-auto-fix` with `max_retries > 1`**: `max_retries` is effectively ignored when auto-fix is disabled. The command gets exactly one try. No need to change `max_retries`; the fix loop is simply never entered.
+### `internal/config/config.go`
+- Contains NO references to `StatusRetrying` or "retry" wording. `MaxRetries` TOML key stays. No changes needed.
 
-4. **Per-command `auto_fix = true` with global `auto_fix = false`**: Per-command wins in `ToCommands()`. But `--no-auto-fix` CLI flag overrides all (loops through every command).
+### `internal/types/types.go` (beyond Step 1)
+- `MaxRetries` field name on `Command` (line 65) and `SessionCommand` (line 205) — stays the same (TOML/JSON key, would break configs/sessions)
 
-5. **`auto_fix = false` with no verify command**: Same behavior — if execution fails (non-zero exit), fail immediately without fix attempt.
+### `autoclaude.toml`
+- This is the project's own task config file (the commands that built autoclaude itself). It contains historical references to the retry-to-auto-fix migration as prompt strings. **No changes needed** — this file is a historical record of the build steps.
 
-6. **Session resume with `AutoFix = false`**: Preserved through persistence. On resume, the command still has `AutoFix = false` and won't enter fix loop. `--reset-attempts` does NOT change `AutoFix`.
-
----
-
-## Files Modified Summary
-
-| File | Changes |
-|------|---------|
-| `internal/config/config.go` | Add `AutoFix *bool` to `ConfigFile` and `ConfigCommand`; resolve in `ToCommands()` |
-| `internal/types/types.go` | Add `AutoFix bool` to `Command`; add `AutoFix *bool` to `SessionCommand`; update `NewCommand()`, `ToSessionCommand()`, `FromSessionCommand()` |
-| `internal/runner/runner.go` | Guard 3 `goto fixLoop` sites with `if !cmd.AutoFix` check |
-| `main.go` | Add `--no-auto-fix` flag; apply to all commands; update `usage()` |
-| `internal/config/init.go` | Add commented `# auto_fix = true` to sample config |
-| `README.md` | Document `auto_fix` in config table, flag table, and auto-fix behavior section |
+### `PLAN.md`, `plan.impl.md`
+- Historical planning documents from earlier implementation steps. **No changes needed** — these are internal artifacts, not user-facing documentation.
 
 ---
 
-## Verification
+## Edge cases
 
-After implementation:
-- `go vet ./...` — should pass with no issues
-- `go build -o autoclaude .` — should compile successfully
-- `go mod tidy` — no changes expected (no new dependencies)
+1. **Existing session files with `"Retrying"` status**: `ParseCommandStatus()` already maps unknown strings (including `"Retrying"`) to `StatusPending`, so these commands restart from the beginning. This behavior is unchanged.
+
+2. **Iota value shift**: `StatusFixing` moves from 9 to 8. Session files store status as strings, not integers, so this is safe. No external API depends on the numeric value.
+
+3. **`max_retries` naming**: Intentionally preserved everywhere — TOML config key, CLI flag name, JSON session key, Go struct field names. Renaming would break backward compatibility.
+
+---
+
+## Files changed (summary)
+
+| File | Type of change |
+|------|---------------|
+| `internal/types/types.go` | Remove `StatusRetrying` constant and `"Retrying"` label |
+| `internal/tui/model.go` | Update 3 comments: "retry budget" → "fix attempt budget" |
+| `main.go` | Update 2 strings: usage text and flag description |
+| `internal/config/init.go` | Update 1 sample prompt string |
+| `example.autoclaude.toml` | Update 3 comments |
+| `README.md` | Update ~8 instances of "retry" wording |
+| `CLAUDE.md` | Remove StatusRetrying references, update ~5 "retry" wordings |

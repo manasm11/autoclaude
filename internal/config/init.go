@@ -32,7 +32,7 @@ prompt = "Describe your second task here."
 # verify is optional — omit it to skip verification
 
 [[command]]
-prompt = "Describe a task with custom retry limit."
+prompt = "Describe a task with custom fix attempt limit."
 verify = "go test ./..."
 max_retries = 5  # overrides the global max_retries for this command
 `

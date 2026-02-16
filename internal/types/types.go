@@ -18,8 +18,7 @@ const (
 	StatusCommitting                      // 5
 	StatusSuccess                         // 6
 	StatusFailed                          // 7
-	StatusRetrying                        // 8
-	StatusFixing                          // 9
+	StatusFixing                          // 8
 )
 
 // String returns the human-readable label for a CommandStatus value.
@@ -33,7 +32,6 @@ func (s CommandStatus) String() string {
 		"Committing",
 		"Success",
 		"Failed",
-		"Retrying",
 		"Fixing",
 	}
 	if int(s) < 0 || int(s) >= len(labels) {
