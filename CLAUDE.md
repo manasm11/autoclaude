@@ -17,7 +17,7 @@ go test ./...
 
 - `main.go` — CLI entry point (flag parsing, config loading, TUI launch)
 - `internal/runner/` — Command execution engine
-- `internal/types/` — Shared types (`Command`, `CommandStatus`, `SessionCommand`)
+- `internal/types/` — Shared types (`Command`, `CommandStatus`, `SessionCommand`, `AttemptLog`)
 - `internal/session/` — Session persistence (`.autoclaude-session.json`)
 - `internal/tui/` — BubbleTea TUI views (input, queue, running, resume)
 - `internal/config/` — TOML config parsing
@@ -30,6 +30,13 @@ go test ./...
 - **Separated stdout/stderr capture**: `runCommandStreaming` returns a `CommandResult` struct containing separate `Stdout`, `Stderr`, and `ExitCode` fields. Uses `io.TeeReader` to simultaneously stream to the TUI and buffer stdout/stderr independently.
 - **Exit code extraction**: On error, the exit code is extracted via type assertion to `*exec.ExitError`. If the error is not an `ExitError` (e.g. process couldn't start), exit code is `-1`.
 - `runClaude` and `runVerify` are thin wrappers around `runCommandStreaming`. They currently use only the combined output string and error; the `CommandResult` is available for future use.
+
+### Attempt logging (internal/types/types.go)
+
+- `AttemptLog` records per-attempt details: timing (start/end/duration), failed step, exit code, stdout/stderr, working directory, and git state (branch, status).
+- `Command.AttemptLogs` accumulates one entry per retry attempt.
+- `Command.FormatFailureReport()` renders all attempt logs into a human-readable debug report with indented stdout/stderr.
+- Session persistence uses `SessionAttemptLog` (JSON-friendly mirror of `AttemptLog`) with time as RFC3339 strings and duration as milliseconds. Conversion helpers: `ToSessionCommand()` / `FromSessionCommand()` handle the mapping.
 
 ### Execution flow
 

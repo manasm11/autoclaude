@@ -192,6 +192,17 @@ Pending → Planning → Running → Verifying → Documenting → Committing �
 - The CLI `--max-retries` flag sets the global default.
 - On the **first permanent failure**, execution halts — remaining commands stay Pending.
 
+### Attempt logging
+
+Each retry attempt is recorded in a detailed attempt log capturing:
+
+- Timing (start, end, duration)
+- Which step failed (Planning, Running, Verifying, etc.)
+- Exit code, stdout, and stderr
+- Working directory and git state (branch, status)
+
+Attempt logs are persisted in the session file and survive session resume. When a command fails permanently, `FormatFailureReport()` produces a readable debug report showing all attempts with their outputs — useful for diagnosing flaky tests or intermittent failures.
+
 ## Automatic documentation updates
 
 After each command completes verification (or execution if no verify step is set), autoclaude automatically asks Claude to update project documentation before committing:
