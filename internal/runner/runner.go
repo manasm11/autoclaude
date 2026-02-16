@@ -2,6 +2,7 @@ package runner
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -35,6 +36,13 @@ type ExecutionErrorMsg struct {
 type OutputLineMsg struct {
 	CmdIndex int
 	Line     string
+}
+
+// CommandResult holds the structured output from a command execution.
+type CommandResult struct {
+	Stdout   string
+	Stderr   string
+	ExitCode int
 }
 
 // Runner manages sequential execution of commands.
@@ -291,22 +299,26 @@ func (r *Runner) saveSession() {
 	}
 }
 
-func (r *Runner) runCommandStreaming(cmdIndex int, name string, args ...string) (string, error) {
+func (r *Runner) runCommandStreaming(cmdIndex int, name string, args ...string) (string, CommandResult, error) {
 	cmd := exec.CommandContext(r.ctx, name, args...)
 	cmd.Dir = r.WorkDir
 
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
-		return "", fmt.Errorf("stdout pipe: %w", err)
+		return "", CommandResult{ExitCode: -1}, fmt.Errorf("stdout pipe: %w", err)
 	}
 	stderrPipe, err := cmd.StderrPipe()
 	if err != nil {
-		return "", fmt.Errorf("stderr pipe: %w", err)
+		return "", CommandResult{ExitCode: -1}, fmt.Errorf("stderr pipe: %w", err)
 	}
 
 	if err := cmd.Start(); err != nil {
-		return "", fmt.Errorf("start: %w", err)
+		return "", CommandResult{ExitCode: -1}, fmt.Errorf("start: %w", err)
 	}
+
+	var stdoutBuf, stderrBuf bytes.Buffer
+	stdoutTee := io.TeeReader(stdoutPipe, &stdoutBuf)
+	stderrTee := io.TeeReader(stderrPipe, &stderrBuf)
 
 	var mu sync.Mutex
 	var lines []string
@@ -331,23 +343,40 @@ func (r *Runner) runCommandStreaming(cmdIndex int, name string, args ...string) 
 	}
 
 	wg.Add(2)
-	go readPipe(stdoutPipe)
-	go readPipe(stderrPipe)
+	go readPipe(stdoutTee)
+	go readPipe(stderrTee)
 	wg.Wait()
 
-	err = cmd.Wait()
+	waitErr := cmd.Wait()
 
 	mu.Lock()
 	output := strings.Join(lines, "\n")
 	mu.Unlock()
 
-	return output, err
+	exitCode := 0
+	if waitErr != nil {
+		if exitErr, ok := waitErr.(*exec.ExitError); ok {
+			exitCode = exitErr.ExitCode()
+		} else {
+			exitCode = -1
+		}
+	}
+
+	result := CommandResult{
+		Stdout:   stdoutBuf.String(),
+		Stderr:   stderrBuf.String(),
+		ExitCode: exitCode,
+	}
+
+	return output, result, waitErr
 }
 
 func (r *Runner) runClaude(cmdIndex int, prompt string) (string, error) {
-	return r.runCommandStreaming(cmdIndex, "claude", "--dangerously-skip-permissions", "-p", prompt)
+	output, _, err := r.runCommandStreaming(cmdIndex, "claude", "--dangerously-skip-permissions", "-p", prompt)
+	return output, err
 }
 
 func (r *Runner) runVerify(cmdIndex int, verifyCmd string) (string, error) {
-	return r.runCommandStreaming(cmdIndex, "sh", "-c", verifyCmd)
+	output, _, err := r.runCommandStreaming(cmdIndex, "sh", "-c", verifyCmd)
+	return output, err
 }

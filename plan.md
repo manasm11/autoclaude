@@ -1,215 +1,176 @@
-# Implementation Plan: `autoclaude init` Subcommand
+# Plan: Separate stdout/stderr capture in runner.go
 
 ## Overview
 
-Add an `init` subcommand that generates a sample `autoclaude.toml` file in the current working directory. The subcommand supports a `--force` flag to overwrite an existing file.
+Refactor the output capture in `runCommandStreaming` (`internal/runner/runner.go:294`) to collect stdout and stderr into separate `bytes.Buffer` variables and extract a structured exit code. Both `runClaude` and `runVerify` delegate to this single function, so changing it covers all `exec.Cmd` usage. No changes to overall execution flow.
 
 ---
 
-## Files to Modify
+## File to Modify
 
-### 1. `main.go`
+**`internal/runner/runner.go`** — this is the only file that needs changes.
 
-**What to change:** Insert a subcommand check before flag parsing (between line 59 `func main() {` and line 61 where flag variables are declared).
+---
 
-**Exact changes:**
+## Step-by-step Changes
 
-- Add `"path/filepath"` is already imported (line 9) — no import changes needed for path handling.
-- After `func main() {` (line 59) and before the flag variable declarations (line 61), add a subcommand intercept block:
+### Step 1: Add `"bytes"` to the import block (lines 3–16)
 
-```
-// Subcommand handling — check before flag.Parse() so "init" isn't
-// consumed as an unknown flag.
-if len(os.Args) >= 2 && os.Args[1] == "init" {
-    force := false
-    for _, arg := range os.Args[2:] {
-        if arg == "--force" {
-            force = true
-        } else {
-            fmt.Fprintf(os.Stderr, "Unknown flag for init: %s\n")
-            os.Exit(1)
-        }
-    }
-    wd, err := os.Getwd()
-    if err != nil {
-        fmt.Fprintf(os.Stderr, "Error getting working directory: %v\n", err)
-        os.Exit(1)
-    }
-    if err := config.GenerateSampleConfig(wd, force); err != nil {
-        fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-        os.Exit(1)
-    }
-    os.Exit(0)
+Add `"bytes"` to the standard library import group. It goes alphabetically between `"bufio"` and `"context"`.
+
+### Step 2: Define a `CommandResult` struct (after existing message types, ~line 38)
+
+Add a new struct after `OutputLineMsg`:
+
+```go
+type CommandResult struct {
+    Stdout   string
+    Stderr   string
+    ExitCode int
 }
 ```
 
-- **Why before flag parsing:** `flag.Parse()` will error on `init` as a positional arg is fine, but `--force` would be an unknown flag. Intercepting early avoids conflicts with the existing flag set entirely.
+- `Stdout` — captured stdout text only
+- `Stderr` — captured stderr text only
+- `ExitCode` — 0 on success, actual exit code from `*exec.ExitError` on process failure, -1 for non-exit errors (command not found, pipe failures, context cancellation)
 
-**Update `usage()` function** (lines 33–57):
+### Step 3: Change `runCommandStreaming` signature (line 294)
 
-- Add `init` subcommand to the Usage section. Modify the `Usage:` block to show:
-  ```
-  Usage:
-    autoclaude [flags]
-    autoclaude init [--force]
-  ```
-- Add a `Subcommands:` section after the Usage block and before the Flags section:
-  ```
-  Subcommands:
-    init            Generate a sample autoclaude.toml in the current directory
-      --force       Overwrite existing autoclaude.toml
-  ```
+From:
+```go
+func (r *Runner) runCommandStreaming(cmdIndex int, name string, args ...string) (string, error)
+```
+To:
+```go
+func (r *Runner) runCommandStreaming(cmdIndex int, name string, args ...string) (string, CommandResult, error)
+```
 
----
+Three returns:
+1. `string` — interleaved stdout+stderr combined output (identical to current behavior, preserves chronological line ordering for the TUI)
+2. `CommandResult` — separated stdout, stderr, and exit code for future structured use
+3. `error` — same as current
 
-### 2. `internal/config/init.go` (NEW FILE)
+### Step 4: Refactor `runCommandStreaming` body
 
-**Create this file** in the `internal/config/` directory.
-
-**Package:** `config`
-
-**Imports:** `fmt`, `os`, `path/filepath`
-
-**Function signature:**
+#### 4a: Add two `bytes.Buffer` variables (after pipe creation, before `cmd.Start()`)
 
 ```go
-func GenerateSampleConfig(dir string, force bool) error
+var stdoutBuf, stderrBuf bytes.Buffer
 ```
 
-**Behavior:**
+#### 4b: Wrap pipes with `io.TeeReader` (before passing to scanners)
 
-1. Construct the target path: `filepath.Join(dir, "autoclaude.toml")`
-2. Check if the file already exists using `os.Stat()`:
-   - If it exists AND `force` is `false`: return an error with message `"autoclaude.toml already exists in <dir>. Use --force to overwrite."`
-   - If it exists AND `force` is `true`: proceed to overwrite
-   - If it does not exist: proceed to create
-3. Write the sample TOML content (defined as a raw string constant in the same file) using `os.WriteFile()` with permissions `0644`
-4. Print to stdout:
-   ```
-   Created autoclaude.toml in <dir>
-   Edit the file to add your commands, then run: autoclaude
-   ```
-5. Return `nil` on success
-
-**Constant to define in the file:**
+Replace the direct pipe usage with tee readers so that raw bytes are captured in the buffers while still being scanned line-by-line for the TUI:
 
 ```go
-const sampleConfig = `...`
+stdoutReader := io.TeeReader(stdoutPipe, &stdoutBuf)
+stderrReader := io.TeeReader(stderrPipe, &stderrBuf)
 ```
 
-The sample config content (raw string literal):
+Then in the two `readPipe` goroutine calls, pass `stdoutReader` and `stderrReader` respectively instead of `stdoutPipe` and `stderrPipe`.
 
-```toml
-# autoclaude configuration file
-# Run with: autoclaude -f autoclaude.toml
-# Or just run `autoclaude` in this directory (auto-detected)
+The existing `readPipe` closure, `lines` slice, mutex, and `OutputLineMsg` streaming all remain exactly as-is. The only difference is the pipe data now flows through the tee reader on its way to the scanner.
 
-# Global settings
-max_retries = 3
-# work_dir = "."  # defaults to current directory
+#### 4c: Extract exit code after `cmd.Wait()` (after line 338)
 
-# Each [[command]] block defines a Claude Code task to run sequentially.
-# After each successful command, changes are auto-committed and pushed.
+After the existing `err = cmd.Wait()`:
 
-[[command]]
-prompt = """
-Describe your first task here.
-You can use multi-line strings for complex prompts.
-Be specific about what files to create/modify and the expected behavior.
-"""
-verify = "go build ./..."  # optional: shell command to verify the change
-
-[[command]]
-prompt = "Describe your second task here."
-# verify is optional — omit it to skip verification
-
-[[command]]
-prompt = "Describe a task with custom retry limit."
-verify = "go test ./..."
-max_retries = 5  # overrides the global max_retries for this command
+```go
+exitCode := 0
+if err != nil {
+    if exitErr, ok := err.(*exec.ExitError); ok {
+        exitCode = exitErr.ExitCode()
+    } else {
+        exitCode = -1
+    }
+}
 ```
 
-**Edge cases to handle:**
+#### 4d: Update the return statement (currently line 344)
 
-- `dir` does not exist or is not writable → `os.WriteFile` will return an error, which gets propagated
-- `dir` is empty string → should not happen since caller resolves via `os.Getwd()`, but `filepath.Join` handles it gracefully
-- File exists as a directory named `autoclaude.toml` → `os.WriteFile` will fail with a descriptive OS error
-- Existing file is a symlink → `os.Stat` follows symlinks, so the existence check works correctly; `os.WriteFile` will overwrite the symlink target (acceptable behavior with `--force`)
+From:
+```go
+return output, err
+```
+To:
+```go
+return output, CommandResult{
+    Stdout:   stdoutBuf.String(),
+    Stderr:   stderrBuf.String(),
+    ExitCode: exitCode,
+}, err
+```
+
+#### 4e: Update early-return error paths
+
+There are three early returns that currently return `("", error)`. Each must be updated to return the three-value signature:
+
+- **Line 300** (stdout pipe error): `return "", CommandResult{ExitCode: -1}, fmt.Errorf("stdout pipe: %w", err)`
+- **Line 303** (stderr pipe error): `return "", CommandResult{ExitCode: -1}, fmt.Errorf("stderr pipe: %w", err)`
+- **Line 308** (start error): `return "", CommandResult{ExitCode: -1}, fmt.Errorf("start: %w", err)`
+
+### Step 5: Update `runClaude` (lines 347–349)
+
+From:
+```go
+func (r *Runner) runClaude(cmdIndex int, prompt string) (string, error) {
+    return r.runCommandStreaming(cmdIndex, "claude", "--dangerously-skip-permissions", "-p", prompt)
+}
+```
+To:
+```go
+func (r *Runner) runClaude(cmdIndex int, prompt string) (string, error) {
+    output, _, err := r.runCommandStreaming(cmdIndex, "claude", "--dangerously-skip-permissions", "-p", prompt)
+    return output, err
+}
+```
+
+The `CommandResult` is discarded with `_` since we're not changing execution flow yet. The `(string, error)` return signature of `runClaude` is preserved, so all callers in `executeSingle` remain untouched.
+
+### Step 6: Update `runVerify` (lines 351–353)
+
+From:
+```go
+func (r *Runner) runVerify(cmdIndex int, verifyCmd string) (string, error) {
+    return r.runCommandStreaming(cmdIndex, "sh", "-c", verifyCmd)
+}
+```
+To:
+```go
+func (r *Runner) runVerify(cmdIndex int, verifyCmd string) (string, error) {
+    output, _, err := r.runCommandStreaming(cmdIndex, "sh", "-c", verifyCmd)
+    return output, err
+}
+```
+
+Same treatment — `CommandResult` discarded for now.
 
 ---
 
-### 3. `README.md`
+## Edge Cases
 
-**What to change:** Add documentation for the `init` subcommand in three places.
+1. **Command not found / exec failure**: `cmd.Start()` returns error before any output. Return empty buffers and `ExitCode: -1`.
 
-#### 3a. Add Quick Start section (NEW)
+2. **Signal-killed process (SIGKILL, SIGTERM)**: `*exec.ExitError` will be present. `ExitCode()` returns -1 on some platforms for signal death — this is correct and expected.
 
-Insert a new `## Quick Start` section between the `## Installation` section (ends at line 24) and the `## Usage` section (starts at line 26).
+3. **Context cancellation** (`r.ctx` cancelled): The command is killed. `cmd.Wait()` returns an error. If it's an `*exec.ExitError`, use its exit code; otherwise -1.
 
-Content:
+4. **Empty stdout or stderr**: Buffers will be empty strings. No special handling needed.
 
-```markdown
-## Quick Start
+5. **Very large output**: `bytes.Buffer` grows dynamically, same memory characteristics as the existing `[]string` approach. No regression.
 
-```sh
-autoclaude init       # generates a sample autoclaude.toml
-# edit autoclaude.toml to add your commands
-autoclaude            # runs the commands
-```
-```
-
-#### 3b. Add init subcommand documentation in Usage section
-
-Insert a new subsection after the `## Usage` intro paragraph (line 28) and before `### 1. Interactive TUI` (line 30). This becomes a "step zero" in the workflow.
-
-Content:
-
-```markdown
-### Generating a config file
-
-Use `init` to create a sample config file in the current directory:
-
-```sh
-autoclaude init
-```
-
-This creates `autoclaude.toml` with a well-commented template showing the available options. If the file already exists, autoclaude will refuse to overwrite it:
-
-```sh
-autoclaude init --force   # overwrite existing autoclaude.toml
-```
-```
-
-#### 3c. Add to Flag reference table
-
-Insert a row in the flag reference table (after line 127, the `--clear-session` row and before the `-h` row) — actually, since `init` is a subcommand not a flag, instead add a new section.
-
-Insert a `## Subcommands` section between the `## Flag reference` section (ends at line 128) and the `## Command lifecycle` section (starts at line 129).
-
-Content:
-
-```markdown
-## Subcommands
-
-| Subcommand | Description |
-|------------|-------------|
-| `init` | Generate a sample `autoclaude.toml` in the current directory |
-| `init --force` | Overwrite an existing `autoclaude.toml` |
-```
+6. **TeeReader + Scanner interaction**: `io.TeeReader` writes bytes to the buffer as they're read by the scanner. Since the scanner reads until the pipe closes (process exits), all bytes will be captured. No data loss.
 
 ---
 
-## Summary of All Changes
+## What Does NOT Change
 
-| File | Action | Lines Affected |
-|------|--------|---------------|
-| `main.go` | Modify | Insert subcommand check after line 59 (before flag vars), update `usage()` at lines 33–57 |
-| `internal/config/init.go` | Create | New file (~45 lines) with `GenerateSampleConfig()` function and `sampleConfig` constant |
-| `README.md` | Modify | Insert Quick Start after line 24, init docs after line 28, Subcommands section after line 128 |
-
-## What NOT to Change
-
-- `internal/config/config.go` — no changes needed; the init logic is independent
-- `example.autoclaude.toml` — keep as-is; it serves a different purpose (detailed reference example vs. the minimal getting-started template from `init`)
-- No new dependencies required — only uses `os`, `fmt`, `path/filepath` from stdlib
-- No changes to the TUI, runner, session, or types packages
+- `executeSingle` method and its retry/flow logic — completely untouched
+- `runClaude` and `runVerify` public signatures — still return `(string, error)`
+- All callers of `runClaude`/`runVerify` in `executeSingle` — untouched
+- TUI message types (`StatusUpdateMsg`, `OutputLineMsg`, etc.) — untouched
+- Streaming behavior (lines sent to TUI via `OutputLineMsg`) — untouched
+- `types.Command` struct — untouched
+- Session persistence — untouched
+- No new files created
+- No new dependencies (only `"bytes"` added to imports, which is stdlib)
