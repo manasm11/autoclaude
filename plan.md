@@ -1,317 +1,335 @@
-# Implementation Plan: Populate AttemptLog Entries in Execution Loop
+# Plan: Audit and Fix Retry Mechanism
 
-## File to Modify
+## Current State Analysis
 
-**`internal/runner/runner.go`** — the only file that needs changes.
+### What's already correct
+- **Loop arithmetic**: `for cmd.Attempts < cmd.MaxRetries { cmd.Attempts++; ... }` with MaxRetries=3 yields exactly 3 total attempts. No off-by-one.
+- **Verification retries full cycle**: On verify failure, `cmd.PlanOutput = ""` forces fresh planning on next iteration. Correct.
+- **Doc/commit are non-fatal**: Both are outside the retry loop and use `updateLastAttempt`. Correct.
 
-No new files. No changes to `internal/types/types.go` (the `AttemptLog` struct already has all needed fields).
-
----
-
-## Overview of Changes
-
-The `executeSingle` method currently runs the retry loop without recording any `AttemptLog` entries. We need to:
-
-1. Add a helper method to capture git context
-2. Modify `runClaude` and `runVerify` to return `CommandResult` (they currently discard it)
-3. Restructure the retry loop in `executeSingle` to build an `AttemptLog` per attempt and append it to `cmd.AttemptLogs` on every exit path
-
----
-
-## Detailed Changes
-
-### Change 1: Add `captureGitContext` helper method
-
-**Location:** After the `runVerify` method (after line 382), add a new method on `*Runner`.
-
-**Function signature:**
-```go
-func (r *Runner) captureGitContext() (branch string, status string)
-```
-
-**Behavior:**
-- Run `exec.Command("git", "branch", "--show-current")` with `Dir` set to `r.WorkDir`. Capture stdout via `cmd.Output()`. On any error, return `""` for branch.
-- Run `exec.Command("git", "status", "--porcelain")` with `Dir` set to `r.WorkDir`. Capture stdout via `cmd.Output()`. On any error, return `""` for status.
-- Trim whitespace (`strings.TrimSpace`) from both outputs before returning.
-- These are quick local commands, no need for context cancellation or streaming.
-
-### Change 2: Update `runClaude` to return `CommandResult`
-
-**Location:** Lines 374-377, the `runClaude` method.
-
-**Current signature:**
-```go
-func (r *Runner) runClaude(cmdIndex int, prompt string) (string, error)
-```
-
-**New signature:**
-```go
-func (r *Runner) runClaude(cmdIndex int, prompt string) (string, CommandResult, error)
-```
-
-**Change:** Instead of discarding the `CommandResult` with `_`, return it:
-```go
-func (r *Runner) runClaude(cmdIndex int, prompt string) (string, CommandResult, error) {
-    return r.runCommandStreaming(cmdIndex, "claude", "--dangerously-skip-permissions", "-p", prompt)
-}
-```
-
-### Change 3: Update `runVerify` to return `CommandResult`
-
-**Location:** Lines 379-382, the `runVerify` method.
-
-**Current signature:**
-```go
-func (r *Runner) runVerify(cmdIndex int, verifyCmd string) (string, error)
-```
-
-**New signature:**
-```go
-func (r *Runner) runVerify(cmdIndex int, verifyCmd string) (string, CommandResult, error)
-```
-
-**Change:** Same pattern — return the `CommandResult`:
-```go
-func (r *Runner) runVerify(cmdIndex int, verifyCmd string) (string, CommandResult, error) {
-    return r.runCommandStreaming(cmdIndex, "sh", "-c", verifyCmd)
-}
-```
-
-### Change 4: Restructure `executeSingle` to populate AttemptLog
-
-This is the main change. The method at lines 137-258 needs restructuring within the retry loop.
-
-#### 4a: Add helper closures at the top of `executeSingle`
-
-Right after the `success := false` declaration (line 138), add two helper closures:
-
-```go
-finalizeAttempt := func(log *types.AttemptLog, failedStep string, exitCode int, stdoutBuf, stderrBuf *strings.Builder) {
-    log.FailedStep = failedStep
-    log.ExitCode = exitCode
-    log.EndedAt = time.Now()
-    log.Duration = log.EndedAt.Sub(log.StartedAt)
-    log.Stdout = stdoutBuf.String()
-    log.Stderr = stderrBuf.String()
-    cmd.AttemptLogs = append(cmd.AttemptLogs, *log)
-}
-
-updateLastAttempt := func(result CommandResult, failedStep string) {
-    if len(cmd.AttemptLogs) == 0 {
-        return
-    }
-    last := &cmd.AttemptLogs[len(cmd.AttemptLogs)-1]
-    last.Stdout += result.Stdout
-    last.Stderr += result.Stderr
-    if failedStep != "" {
-        last.FailedStep = failedStep
-        last.ExitCode = result.ExitCode
-    }
-    last.EndedAt = time.Now()
-    last.Duration = last.EndedAt.Sub(last.StartedAt)
-}
-```
-
-#### 4b: At the top of each retry iteration (after `cmd.Attempts++`, line 140)
-
-Add the following steps immediately after `cmd.Attempts++`:
-
-1. Record `attemptStart := time.Now()`
-2. Call `gitBranch, gitStatus := r.captureGitContext()`
-3. Initialize an `AttemptLog` struct:
-   ```go
-   attemptLog := types.AttemptLog{
-       AttemptNumber: cmd.Attempts,
-       StartedAt:     attemptStart,
-       WorkDir:       r.WorkDir,
-       GitBranch:     gitBranch,
-       GitStatus:     gitStatus,
-   }
-   ```
-4. Initialize accumulator variables for stdout/stderr across steps within this attempt:
-   ```go
-   var attemptStdout, attemptStderr strings.Builder
-   ```
-
-#### 4c: Planning step (lines 143-165)
-
-**Current code calls:**
-```go
-planOutput, planErr := r.runClaude(i, planPrompt)
-```
-
-**Change to:**
-```go
-planOutput, planResult, planErr := r.runClaude(i, planPrompt)
-```
-
-After the call, accumulate stdout/stderr:
-```go
-attemptStdout.WriteString(planResult.Stdout)
-attemptStderr.WriteString(planResult.Stderr)
-```
-
-Record the command string in `attemptLog`:
-```go
-attemptLog.Command = fmt.Sprintf("claude --dangerously-skip-permissions -p [planning prompt, %d chars]", len(planPrompt))
-```
-
-On **planning failure** — both the `continue` path (line 155, when retries remain) and the `return false` path (line 161, when retries exhausted) — insert before `continue` or `return false`:
-```go
-finalizeAttempt(&attemptLog, "Planning", planResult.ExitCode, &attemptStdout, &attemptStderr)
-```
-
-#### 4d: Execution step (lines 167-189)
-
-**Current code calls:**
-```go
-execOutput, execErr := r.runClaude(i, execPrompt)
-```
-
-**Change to:**
-```go
-execOutput, execResult, execErr := r.runClaude(i, execPrompt)
-```
-
-After the call, accumulate:
-```go
-attemptStdout.WriteString(execResult.Stdout)
-attemptStderr.WriteString(execResult.Stderr)
-```
-
-Update the command string (overwrite the planning command — the log now reflects the last step attempted):
-```go
-attemptLog.Command = fmt.Sprintf("claude --dangerously-skip-permissions -p [execution prompt, %d chars]", len(execPrompt))
-```
-
-On **execution failure** (both `continue` and `return false` paths), insert before `continue` or `return false`:
-```go
-finalizeAttempt(&attemptLog, "Running", execResult.ExitCode, &attemptStdout, &attemptStderr)
-```
-
-#### 4e: Verification step (lines 192-213)
-
-**Current code calls:**
-```go
-verifyOutput, verifyErr := r.runVerify(i, cmd.Verify)
-```
-
-**Change to:**
-```go
-verifyOutput, verifyResult, verifyErr := r.runVerify(i, cmd.Verify)
-```
-
-After the call, accumulate:
-```go
-attemptStdout.WriteString(verifyResult.Stdout)
-attemptStderr.WriteString(verifyResult.Stderr)
-```
-
-Update the command string:
-```go
-attemptLog.Command = cmd.Verify
-```
-
-On **verification failure** (both paths), insert before `continue` or `return false`:
-```go
-finalizeAttempt(&attemptLog, "Verifying", verifyResult.ExitCode, &attemptStdout, &attemptStderr)
-```
-
-#### 4f: On successful completion of the retry loop (before `break` at line 217)
-
-When plan + execution + verify all pass, we still need to log the attempt. Before `break`, insert:
-```go
-finalizeAttempt(&attemptLog, "", 0, &attemptStdout, &attemptStderr)
-```
-
-An empty `FailedStep` with exit code 0 indicates success.
-
-#### 4g: Documentation step (lines 228-241) — post-retry-loop, success path only
-
-**Current code calls:**
-```go
-docOutput, docErr := r.runClaude(i, docPrompt)
-```
-
-**Change to:**
-```go
-docOutput, docResult, docErr := r.runClaude(i, docPrompt)
-```
-
-After the call (regardless of success/failure), update the last AttemptLog:
-- If `docErr != nil`: `updateLastAttempt(docResult, "Documenting")`
-- If `docErr == nil`: `updateLastAttempt(docResult, "")` (just accumulate output, don't mark failure since doc is non-fatal — but we still want stdout/stderr captured)
-
-**Note:** Since documentation is non-fatal, even if we set FailedStep to "Documenting", the overall command still proceeds to commit. The FailedStep field here records what went wrong, not that the whole command failed.
-
-#### 4h: Commit step (lines 244-257) — post-retry-loop, success path only
-
-**Current code calls:**
-```go
-commitOutput, commitErr := r.runClaude(i, "Git add all changes...")
-```
-
-**Change to:**
-```go
-commitOutput, commitResult, commitErr := r.runClaude(i, "Git add all changes...")
-```
-
-After the call, update the last AttemptLog:
-- If `commitErr != nil`: `updateLastAttempt(commitResult, "Committing")`
-- If `commitErr == nil`: `updateLastAttempt(commitResult, "")`
+### Bugs to fix
+1. **No sleep between retries** — `continue` fires immediately after `StatusRetrying`
+2. **No retry separator in `cmd.Output`** — user sees no visual boundary between attempts
+3. **No "Attempt N/M" in TUI** — spinner just shows "Planning", "Running", etc. with no attempt counter
+4. **Planning failure doesn't preserve output** — on planning failure in the retry branch (line 206), `cmd.Output` is not set before `sendUpdate`, so the TUI receives `planOutput` as the `Output` field of the message but `cmd.Output` itself is stale
+5. **Planning failure doesn't clear `PlanOutput`** — technically harmless (it's already empty), but inconsistent with exec/verify which explicitly clear it
+6. **Dead code at lines 282-287** — the post-loop `!success` block is unreachable in practice but should be kept as a safety net
 
 ---
 
-## Summary of All Call Sites Changed
+## File Changes
 
-| Step | Current Call | New Call | On Failure | AttemptLog.FailedStep |
-|------|-------------|----------|------------|----------------------|
-| Planning | `runClaude(i, planPrompt)` → `(string, error)` | `runClaude(i, planPrompt)` → `(string, CommandResult, error)` | `finalizeAttempt(...)` + continue/return | `"Planning"` |
-| Execution | `runClaude(i, execPrompt)` → `(string, error)` | `runClaude(i, execPrompt)` → `(string, CommandResult, error)` | `finalizeAttempt(...)` + continue/return | `"Running"` |
-| Verification | `runVerify(i, cmd.Verify)` → `(string, error)` | `runVerify(i, cmd.Verify)` → `(string, CommandResult, error)` | `finalizeAttempt(...)` + continue/return | `"Verifying"` |
-| Documentation | `runClaude(i, docPrompt)` → `(string, error)` | `runClaude(i, docPrompt)` → `(string, CommandResult, error)` | `updateLastAttempt(...)` | `"Documenting"` |
-| Commit | `runClaude(i, commitPrompt)` → `(string, error)` | `runClaude(i, commitPrompt)` → `(string, CommandResult, error)` | `updateLastAttempt(...)` | `"Committing"` |
+### File 1: `internal/runner/runner.go`
+
+#### Change 1.1: Add `StatusDetail` field to `StatusUpdateMsg`
+
+**Lines 20-24.** Add a field for the attempt counter string.
+
+```go
+// Before:
+type StatusUpdateMsg struct {
+    CmdIndex int
+    Status   types.CommandStatus
+    Output   string
+}
+
+// After:
+type StatusUpdateMsg struct {
+    CmdIndex     int
+    Status       types.CommandStatus
+    Output       string
+    StatusDetail string // e.g. "Attempt 2/3"
+}
+```
+
+#### Change 1.2: Update `sendUpdate` signature
+
+**Lines 331-339.** Add `detail string` parameter, populate `StatusDetail` in the message.
+
+```go
+// Before:
+func (r *Runner) sendUpdate(index int, status types.CommandStatus, output string)
+
+// After:
+func (r *Runner) sendUpdate(index int, status types.CommandStatus, output string, detail string)
+```
+
+Body: set `StatusDetail: detail` in the `StatusUpdateMsg` literal.
+
+#### Change 1.3: Update ALL existing `sendUpdate` call sites
+
+Every call to `sendUpdate` must get the new 4th argument. Here is every call site in the function and what to pass:
+
+**Inside the retry loop** (where `cmd.Attempts` is known):
+- Line 194 (planning start): pass `detail` (defined as `fmt.Sprintf("Attempt %d/%d", cmd.Attempts, cmd.MaxRetries)`)
+- Line 206 (planning fail, retry): pass `detail`
+- Line 212 (planning fail, max reached): pass `""`
+- Line 223 (execution start): pass `detail`
+- Line 239 (execution fail, retry): pass `detail`
+- Line 243 (execution fail, max reached): pass `""`
+- Line 251 (verify start): pass `detail`
+- Line 266 (verify fail, retry): pass `detail`
+- Line 270 (verify fail, max reached): pass `""`
+
+**Post-loop:**
+- Line 284 (safety-net fail): pass `""`
+- Line 292 (documenting start): pass `detail` (recomputed after loop as `fmt.Sprintf(...)`)
+- Line 306 (documenting output update): pass `detail`
+- Line 311 (committing start): pass `detail`
+- Line 326 (final success): pass `""`
+
+#### Change 1.4: Define `detail` variable at top of each iteration
+
+Immediately after `cmd.Attempts++` (line 175), add:
+
+```go
+detail := fmt.Sprintf("Attempt %d/%d", cmd.Attempts, cmd.MaxRetries)
+```
+
+And after the retry loop (before doc/commit steps), redefine for post-loop use:
+
+```go
+detail := fmt.Sprintf("Attempt %d/%d", cmd.Attempts, cmd.MaxRetries)
+```
+
+#### Change 1.5: Add 2-second sleep with context cancellation on retry
+
+At each of the three retry points (planning fail + retry, execution fail + retry, verification fail + retry), insert **after** `r.saveSession()` and **before** `continue`:
+
+```go
+select {
+case <-time.After(2 * time.Second):
+case <-r.ctx.Done():
+    cmd.Status = types.StatusFailed
+    r.sendUpdate(i, types.StatusFailed, cmd.Output, "")
+    r.saveSession()
+    return false
+}
+```
+
+Using `select` instead of `time.Sleep` ensures the runner responds promptly to cancellation (e.g., user presses Ctrl+C). Without this, a cancelled runner would block for up to 2 seconds per retry point.
+
+**Three locations to add this:**
+1. Planning failure retry path (after line 208, before `continue`)
+2. Execution failure retry path (after line 240, before `continue`)
+3. Verification failure retry path (after line 268, before `continue`)
+
+#### Change 1.6: Append retry separator to `cmd.Output` on retry
+
+At each retry point, **before** the `StatusRetrying` sendUpdate, append a separator:
+
+```go
+cmd.Output += fmt.Sprintf("\n═══ RETRY %d/%d ═══ (previous attempt failed at: %s, exit code: %d)\n",
+    cmd.Attempts+1, cmd.MaxRetries, "<StepName>", result.ExitCode)
+```
+
+Where `<StepName>` is "Planning", "Running", or "Verifying" depending on the failure point, and `result` is `planResult`, `execResult`, or `verifyResult` respectively. `cmd.Attempts+1` is the upcoming attempt number (since `cmd.Attempts` is the just-finished attempt).
+
+**Three locations:**
+1. Planning failure retry: `"Planning"`, `planResult.ExitCode`
+2. Execution failure retry: `"Running"`, `execResult.ExitCode`
+3. Verification failure retry: `"Verifying"`, `verifyResult.ExitCode`
+
+#### Change 1.7: Fix `cmd.Output` on planning failure
+
+**Current behavior (line 206):** On planning failure with retries remaining, `r.sendUpdate(i, types.StatusRetrying, planOutput)` sends `planOutput` as the output. But `cmd.Output` is never set, so it's stale (empty or from a prior attempt).
+
+**Fix:** Before appending the retry separator, set:
+```go
+cmd.Output += planOutput
+```
+
+This ensures the separator is appended to the actual output, and `cmd.Output` reflects reality.
+
+Also do the same on the max-retries-exceeded path (line 211 currently does `cmd.Output = planOutput` which is correct but should be `cmd.Output += planOutput` for consistency with multi-attempt accumulation).
+
+**Wait, reconsider:** On the first attempt, `cmd.Output` is `""`. Using `+=` is fine. On subsequent attempts, `cmd.Output` already has the retry separator and previous output. Using `+=` correctly accumulates. But line 211 currently uses `=` (assignment), which would **overwrite** prior output. Change line 211 from `cmd.Output = planOutput` to `cmd.Output += planOutput` as well.
+
+#### Change 1.8: Adjust execution step `cmd.Output` assignment
+
+**Line 222:** Currently:
+```go
+cmd.Output = "═══ PLAN ═══\n" + cmd.PlanOutput + "\n═══ EXECUTION ═══\n"
+```
+
+This **overwrites** `cmd.Output`, discarding any prior retry separator and accumulated output. On the first attempt this is fine, but on retry attempts the retry separator was just appended.
+
+**Fix:** Change to:
+```go
+cmd.Output += "═══ PLAN ═══\n" + cmd.PlanOutput + "\n═══ EXECUTION ═══\n"
+```
+
+This preserves the retry separator and any prior output.
+
+#### Change 1.9: Ensure `PlanOutput` is cleared on planning failure retry
+
+**Planning failure retry path:** Add `cmd.PlanOutput = ""` for consistency (it's already empty since we only enter planning when `cmd.PlanOutput == ""`, but be explicit).
 
 ---
 
-## Import Changes
+### File 2: `internal/tui/model.go`
 
-No new imports needed. `runner.go` already imports all required packages:
-- `"os/exec"` — for `captureGitContext`
-- `"strings"` — for `strings.TrimSpace` and `strings.Builder`
-- `"time"` — for `time.Now()`
-- `"fmt"` — for `fmt.Sprintf`
-- `"github.com/manasm11/autoclaude/internal/types"` — for `types.AttemptLog`
+#### Change 2.1: Add `statusDetail` field to `Model` struct
+
+**Around line 120** (in the struct definition), add:
+
+```go
+statusDetail string // transient "Attempt N/M" text from runner
+```
+
+#### Change 2.2: Store `StatusDetail` in `StatusUpdateMsg` handler
+
+**Lines 344-371** (`case runner.StatusUpdateMsg:` in `Update()`).
+
+After `m.commands[msg.CmdIndex].Output = msg.Output` (line 347), add:
+
+```go
+if msg.CmdIndex == m.currentCmd {
+    m.statusDetail = msg.StatusDetail
+}
+```
+
+Also, inside the block where `m.currentCmd` changes (line 352-356):
+
+```go
+if ... && msg.CmdIndex != m.currentCmd {
+    m.currentCmd = msg.CmdIndex
+    m.statusDetail = msg.StatusDetail  // carry detail to new command
+    m.scrollOffset = 0
+    m.outputLines = nil
+}
+```
+
+And clear it on terminal statuses (success/failed) so it doesn't linger:
+
+```go
+if msg.Status == types.StatusSuccess || msg.Status == types.StatusFailed {
+    m.statusDetail = ""
+    // ... existing output reconciliation ...
+}
+```
+
+#### Change 2.3: Display `statusDetail` next to spinner in `viewRunning()`
+
+**Lines 974-977.** After the status text, conditionally append the detail:
+
+```go
+// Current:
+b.WriteString(m.spinner.View())
+b.WriteString(" ")
+b.WriteString(styledStatus(cmd.Status))
+b.WriteString("\n\n")
+
+// New:
+b.WriteString(m.spinner.View())
+b.WriteString(" ")
+b.WriteString(styledStatus(cmd.Status))
+if m.statusDetail != "" {
+    b.WriteString("  ")
+    b.WriteString(lipgloss.NewStyle().Faint(true).Render(m.statusDetail))
+}
+b.WriteString("\n\n")
+```
+
+Result: `⠋ Planning  Attempt 2/3` where "Attempt 2/3" is dimmed.
+
+---
+
+## No changes needed
+
+- **`internal/types/types.go`** — No changes. `Command`, `AttemptLog`, `CommandStatus`, session types all sufficient.
+- **`internal/config/config.go`** — No changes. MaxRetries parsing is correct.
+- **`main.go`** — No changes. Flag handling and config precedence are correct.
+
+---
+
+## Complete Trace: Retry Flow with MaxRetries=3
+
+### Attempt 1 (first run)
+1. `cmd.Attempts` = 0. Loop: `0 < 3` → true. `cmd.Attempts++` → 1.
+2. `detail = "Attempt 1/3"`
+3. Planning: `sendUpdate(StatusPlanning, "", "Attempt 1/3")`
+4. Planning succeeds → `cmd.PlanOutput` set
+5. Execution: `sendUpdate(StatusRunning, ..., "Attempt 1/3")`
+6. Execution succeeds
+7. Verification: `sendUpdate(StatusVerifying, ..., "Attempt 1/3")`
+8. **Verification fails** (exit code 1)
+9. `cmd.PlanOutput = ""`
+10. `finalizeAttempt(attemptLog, "Verifying", 1)`
+11. `cmd.Attempts` (1) `< cmd.MaxRetries` (3) → true → will retry
+12. Append separator: `"\n═══ RETRY 2/3 ═══ (previous attempt failed at: Verifying, exit code: 1)\n"`
+13. `sendUpdate(StatusRetrying, cmd.Output, "Attempt 1/3")`
+14. `saveSession()`
+15. Sleep 2 seconds (with ctx cancellation check)
+16. `continue`
+
+### Attempt 2 (retry)
+1. `cmd.Attempts` = 1. Loop: `1 < 3` → true. `cmd.Attempts++` → 2.
+2. `detail = "Attempt 2/3"`
+3. `cmd.PlanOutput` is "" → Planning runs again: `sendUpdate(StatusPlanning, ..., "Attempt 2/3")`
+4. Planning succeeds
+5. `cmd.Output += "═══ PLAN ═══\n..."` (appends to existing output with separator)
+6. Execution: `sendUpdate(StatusRunning, ..., "Attempt 2/3")`
+7. **Execution fails** (exit code 2)
+8. `cmd.PlanOutput = ""`
+9. `finalizeAttempt(attemptLog, "Running", 2)`
+10. `cmd.Attempts` (2) `< cmd.MaxRetries` (3) → true → will retry
+11. Append separator: `"\n═══ RETRY 3/3 ═══ (previous attempt failed at: Running, exit code: 2)\n"`
+12. `sendUpdate(StatusRetrying, cmd.Output, "Attempt 2/3")`
+13. Sleep 2 seconds
+14. `continue`
+
+### Attempt 3 (final attempt)
+1. `cmd.Attempts` = 2. Loop: `2 < 3` → true. `cmd.Attempts++` → 3.
+2. `detail = "Attempt 3/3"`
+3. Planning: `sendUpdate(StatusPlanning, ..., "Attempt 3/3")`
+4. **Planning fails** (exit code 1)
+5. `finalizeAttempt(attemptLog, "Planning", 1)`
+6. `cmd.Attempts` (3) `< cmd.MaxRetries` (3) → **false** → max reached
+7. `cmd.Status = StatusFailed`
+8. `sendUpdate(StatusFailed, cmd.Output, "")`
+9. `return false`
+
+### MaxRetries=1 (no retries)
+1. `cmd.Attempts` = 0. Loop: `0 < 1` → true. `cmd.Attempts++` → 1.
+2. If any step fails: `cmd.Attempts` (1) `< cmd.MaxRetries` (1) → false → `StatusFailed`, `return false`
+3. Retry separator is never appended. Sleep never happens. Correct.
+
+### Success on first attempt
+1. `cmd.Attempts` = 0 → 1.
+2. Planning, execution, verification all pass.
+3. `finalizeAttempt(attemptLog, "", 0)`, `success = true`, `break`.
+4. Doc step: `sendUpdate(StatusDocumenting, ..., "Attempt 1/3")`
+5. Commit step: `sendUpdate(StatusCommitting, ..., "Attempt 1/3")`
+6. Final: `sendUpdate(StatusSuccess, ..., "")`
 
 ---
 
 ## Edge Cases
 
-1. **Git not available:** `captureGitContext` must handle `exec.Command` returning an error (e.g., git not installed, not a git repo). Return empty strings — already covered by ignoring errors from `cmd.Output()`.
+1. **MaxRetries=0**: Loop never enters. `success` stays false. Post-loop safety net sets `StatusFailed`. Config code prevents this (defaults 0→3), but safety net handles it.
 
-2. **First attempt with resumed session that already has a plan:** The planning step is skipped (`cmd.PlanOutput != ""`), so no planning `CommandResult` is generated. The `attemptLog.Command` will only reflect the execution step. `attemptStdout`/`attemptStderr` will only contain execution output. This is correct behavior — the skipped step contributes nothing to capture.
+2. **Context cancelled during 2s sleep**: The `select` on `r.ctx.Done()` fires immediately, sets `StatusFailed`, returns false. Runner stops cleanly within milliseconds.
 
-3. **Documentation/commit failures are non-fatal:** These happen outside the retry loop. `updateLastAttempt` updates the already-appended last AttemptLog entry in-place. If the doc step fails but commit succeeds, the FailedStep gets overwritten to `""` by the successful commit `updateLastAttempt` call. To avoid this, only call `updateLastAttempt` with a non-empty failedStep when there's an error; pass `""` otherwise so the FailedStep isn't cleared if previously set.
+3. **Resumed session with existing `cmd.Output`**: The `+=` operators for `cmd.Output` correctly accumulate. The retry separator will appear after whatever output existed from the session.
 
-   **Refinement for `updateLastAttempt`:** Change the conditional to: only overwrite `FailedStep` and `ExitCode` if `failedStep != ""`. This way a successful commit won't clear a "Documenting" failure.
+4. **Resumed session resets `Attempts=0`** (model.go line 274): Gives a fresh retry budget. The loop starts from scratch. Correct existing behavior, no change needed.
 
-4. **Context cancellation:** If `r.ctx` is cancelled mid-execution, `runCommandStreaming` returns an error with ExitCode=-1. The standard flow handles it since we finalize on any error.
-
-5. **Empty stdout/stderr:** `CommandResult.Stdout` and `.Stderr` may be empty strings. This is fine — `AttemptLog` fields accept empty strings and `FormatFailureReport` already guards against them.
-
-6. **The `!success` fallthrough after the retry loop (line 220-225):** This path is reached when `cmd.Attempts >= cmd.MaxRetries` without a `break`. The last iteration's AttemptLog was already appended inside the loop body (at each `continue` or `return false` site), so no additional append is needed here.
-
-7. **AttemptLog.Command field — full prompt vs abbreviated:** The full `planPrompt`/`execPrompt` strings can be very long. Store an abbreviated form: `fmt.Sprintf("claude --dangerously-skip-permissions -p [planning prompt, %d chars]", len(planPrompt))`. This keeps logs readable. For verification, store the actual verify command string since those are typically short.
-
-8. **`saveSession()` calls after AttemptLog appends:** The existing `saveSession()` calls remain in their current positions. Since `cmd.AttemptLogs` is appended before `saveSession()` is called (the `finalizeAttempt` call is inserted before the `continue`/`return false` which are before the `saveSession()` calls... wait, checking the code):
-   - On the retry+continue path: the code does `r.sendUpdate(...)` then `r.saveSession()` then `continue`. The `finalizeAttempt` call should go **before** `r.sendUpdate` so the session save captures the new AttemptLog.
-   - On the return false path: same pattern — `finalizeAttempt` before `r.sendUpdate` and `r.saveSession`.
-   - This ensures AttemptLogs are persisted to the session file.
+5. **Doc failure followed by commit success**: `updateLastAttempt("Documenting", docExitCode)` sets FailedStep. Then `updateLastAttempt("", 0)` for commit success doesn't overwrite FailedStep (due to the `if failedStep != ""` guard). The AttemptLog correctly records "Documenting" as the failed step even though the command overall succeeds. No change needed.
 
 ---
 
-## Testing Considerations
+## Verification After Implementation
 
-- Run `go build -o autoclaude .` to verify compilation.
-- Run `go test ./...` to verify existing tests pass with the new `runClaude`/`runVerify` signatures.
-- If any existing tests call `runClaude` or `runVerify` directly, they'll need updating for the 3-return-value signatures.
+1. `go build -o autoclaude .` — must compile
+2. `go test ./...` — must pass
+3. Manual test with `max_retries = 2` and a failing verify command:
+   - Spinner shows "Planning  Attempt 1/2", "Running  Attempt 1/2", "Verifying  Attempt 1/2"
+   - Output shows `═══ RETRY 2/2 ═══ (previous attempt failed at: Verifying, exit code: 1)`
+   - 2-second pause before retry
+   - Fresh planning on attempt 2
+   - If attempt 2 also fails: "Failed" with no "Attempt N/M"
+4. Manual test with `max_retries = 1`:
+   - No retry separator, no sleep, single attempt
+5. Manual test with doc/commit failure:
+   - Warning logged, no retry triggered, command still succeeds

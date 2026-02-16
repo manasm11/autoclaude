@@ -122,6 +122,7 @@ type Model struct {
 	done          bool
 	outputLines   []string
 	statusMsg     string
+	statusDetail  string // e.g. "Attempt 2/3", shown next to spinner
 	autoRun       bool
 	autoLoadCount  int    // number of commands auto-loaded from detected config
 	autoLoadFile   string // filename of auto-detected config (e.g. "autoclaude.toml")
@@ -345,6 +346,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.CmdIndex >= 0 && msg.CmdIndex < len(m.commands) {
 			m.commands[msg.CmdIndex].Status = msg.Status
 			m.commands[msg.CmdIndex].Output = msg.Output
+			m.statusDetail = msg.StatusDetail
 
 			if (msg.Status == types.StatusPlanning || msg.Status == types.StatusRunning || msg.Status == types.StatusVerifying ||
 				msg.Status == types.StatusDocumenting || msg.Status == types.StatusCommitting || msg.Status == types.StatusRetrying) &&
@@ -974,6 +976,10 @@ func (m Model) viewRunningLive() string {
 		b.WriteString(m.spinner.View())
 		b.WriteString(" ")
 		b.WriteString(styledStatus(cmd.Status))
+		if m.statusDetail != "" {
+			b.WriteString("  ")
+			b.WriteString(helpStyle.Render(m.statusDetail))
+		}
 		b.WriteString("\n\n")
 	}
 

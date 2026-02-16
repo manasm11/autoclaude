@@ -186,7 +186,12 @@ Pending → Planning → Running → Verifying → Documenting → Committing �
 
 ### Retry behavior
 
+- `max_retries` means **total attempts**, not additional retries. `max_retries = 3` means the command runs at most 3 times.
 - When Claude or the verification step fails, the command enters **Retrying** and the full cycle repeats from **Planning** with a fresh plan.
+- Each retry is preceded by a 2-second cooldown.
+- The TUI shows "Attempt N/M" next to the spinner during retry-eligible steps (planning, running, verifying).
+- Retry output includes a visible separator: `═══ RETRY 2/3 ═══ (previous attempt failed at: Verifying, exit code: 1)`.
+- **Documenting** and **Committing** failures are non-fatal and never trigger retries — the command still succeeds.
 - Each command tracks its own attempt count against its `max_retries` limit.
 - Per-command `max_retries` in the TOML config overrides the global value.
 - The CLI `--max-retries` flag sets the global default.

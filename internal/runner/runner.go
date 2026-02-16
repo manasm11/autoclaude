@@ -18,9 +18,10 @@ import (
 
 // StatusUpdateMsg is sent to the TUI when a command's status changes.
 type StatusUpdateMsg struct {
-	CmdIndex int
-	Status   types.CommandStatus
-	Output   string
+	CmdIndex     int
+	Status       types.CommandStatus
+	Output       string
+	StatusDetail string // e.g. "Attempt 2/3"
 }
 
 // AllDoneMsg is sent when all commands have finished (or one has permanently failed).
@@ -188,10 +189,12 @@ func (r *Runner) executeSingle(i int, cmd *types.Command) bool {
 			GitStatus:     gitStatus,
 		}
 
+		attemptDetail := fmt.Sprintf("Attempt %d/%d", cmd.Attempts, cmd.MaxRetries)
+
 		// 1. PLANNING — skip if we already have a plan (e.g. resumed session)
 		if cmd.PlanOutput == "" {
 			cmd.Status = types.StatusPlanning
-			r.sendUpdate(i, types.StatusPlanning, "")
+			r.sendUpdate(i, types.StatusPlanning, "", attemptDetail)
 			r.saveSession()
 
 			planPrompt := "You are planning the implementation of a task. Create a detailed step-by-step implementation plan. List every file to create or modify, what exact changes to make in each file, function signatures, and edge cases to handle. Do NOT write any code, do NOT create or modify any files. Only output the plan in markdown.\n\nTask: " + cmd.Prompt
@@ -202,14 +205,21 @@ func (r *Runner) executeSingle(i int, cmd *types.Command) bool {
 			if planErr != nil {
 				finalizeAttempt(attemptLog, "Planning", planResult.ExitCode)
 				if cmd.Attempts < cmd.MaxRetries {
+					cmd.Output += planOutput
+					cmd.Output += fmt.Sprintf("\n═══ RETRY %d/%d ═══ (previous attempt failed at: Planning, exit code: %d)\n", cmd.Attempts+1, cmd.MaxRetries, planResult.ExitCode)
 					cmd.Status = types.StatusRetrying
-					r.sendUpdate(i, types.StatusRetrying, planOutput)
+					r.sendUpdate(i, types.StatusRetrying, cmd.Output, attemptDetail)
 					r.saveSession()
+					select {
+					case <-time.After(2 * time.Second):
+					case <-r.ctx.Done():
+						return false
+					}
 					continue
 				}
 				cmd.Status = types.StatusFailed
-				cmd.Output = planOutput
-				r.sendUpdate(i, types.StatusFailed, planOutput)
+				cmd.Output += planOutput
+				r.sendUpdate(i, types.StatusFailed, cmd.Output, "")
 				r.saveSession()
 				return false
 			}
@@ -219,8 +229,8 @@ func (r *Runner) executeSingle(i int, cmd *types.Command) bool {
 
 		// 2. EXECUTION
 		cmd.Status = types.StatusRunning
-		cmd.Output = "═══ PLAN ═══\n" + cmd.PlanOutput + "\n═══ EXECUTION ═══\n"
-		r.sendUpdate(i, types.StatusRunning, cmd.Output)
+		cmd.Output += "═══ PLAN ═══\n" + cmd.PlanOutput + "\n═══ EXECUTION ═══\n"
+		r.sendUpdate(i, types.StatusRunning, cmd.Output, attemptDetail)
 		r.saveSession()
 
 		execPrompt := "Execute the following implementation plan exactly. Follow each step precisely.\n\nPlan:\n" + cmd.PlanOutput + "\n\nOriginal task: " + cmd.Prompt
@@ -228,19 +238,25 @@ func (r *Runner) executeSingle(i int, cmd *types.Command) bool {
 		execOutput, execResult, execErr := r.runClaude(i, execPrompt)
 		attemptStdout.WriteString(execResult.Stdout)
 		attemptStderr.WriteString(execResult.Stderr)
-		cmd.Output = cmd.Output + execOutput
+		cmd.Output += execOutput
 
 		if execErr != nil {
 			cmd.PlanOutput = "" // fresh plan on retry
 			finalizeAttempt(attemptLog, "Running", execResult.ExitCode)
 			if cmd.Attempts < cmd.MaxRetries {
+				cmd.Output += fmt.Sprintf("\n═══ RETRY %d/%d ═══ (previous attempt failed at: Running, exit code: %d)\n", cmd.Attempts+1, cmd.MaxRetries, execResult.ExitCode)
 				cmd.Status = types.StatusRetrying
-				r.sendUpdate(i, types.StatusRetrying, cmd.Output)
+				r.sendUpdate(i, types.StatusRetrying, cmd.Output, attemptDetail)
 				r.saveSession()
+				select {
+				case <-time.After(2 * time.Second):
+				case <-r.ctx.Done():
+					return false
+				}
 				continue
 			}
 			cmd.Status = types.StatusFailed
-			r.sendUpdate(i, types.StatusFailed, cmd.Output)
+			r.sendUpdate(i, types.StatusFailed, cmd.Output, "")
 			r.saveSession()
 			return false
 		}
@@ -248,26 +264,32 @@ func (r *Runner) executeSingle(i int, cmd *types.Command) bool {
 		// 3. VERIFICATION
 		if cmd.Verify != "" {
 			cmd.Status = types.StatusVerifying
-			r.sendUpdate(i, types.StatusVerifying, cmd.Output)
+			r.sendUpdate(i, types.StatusVerifying, cmd.Output, attemptDetail)
 			r.saveSession()
 
 			attemptLog.Command = cmd.Verify
 			verifyOutput, verifyResult, verifyErr := r.runVerify(i, cmd.Verify)
 			attemptStdout.WriteString(verifyResult.Stdout)
 			attemptStderr.WriteString(verifyResult.Stderr)
-			cmd.Output = cmd.Output + "\n" + verifyOutput
+			cmd.Output += "\n" + verifyOutput
 
 			if verifyErr != nil {
 				cmd.PlanOutput = "" // fresh plan on retry
 				finalizeAttempt(attemptLog, "Verifying", verifyResult.ExitCode)
 				if cmd.Attempts < cmd.MaxRetries {
+					cmd.Output += fmt.Sprintf("\n═══ RETRY %d/%d ═══ (previous attempt failed at: Verifying, exit code: %d)\n", cmd.Attempts+1, cmd.MaxRetries, verifyResult.ExitCode)
 					cmd.Status = types.StatusRetrying
-					r.sendUpdate(i, types.StatusRetrying, cmd.Output)
+					r.sendUpdate(i, types.StatusRetrying, cmd.Output, attemptDetail)
 					r.saveSession()
+					select {
+					case <-time.After(2 * time.Second):
+					case <-r.ctx.Done():
+						return false
+					}
 					continue
 				}
 				cmd.Status = types.StatusFailed
-				r.sendUpdate(i, types.StatusFailed, cmd.Output)
+				r.sendUpdate(i, types.StatusFailed, cmd.Output, "")
 				r.saveSession()
 				return false
 			}
@@ -281,7 +303,7 @@ func (r *Runner) executeSingle(i int, cmd *types.Command) bool {
 
 	if !success {
 		cmd.Status = types.StatusFailed
-		r.sendUpdate(i, types.StatusFailed, cmd.Output)
+		r.sendUpdate(i, types.StatusFailed, cmd.Output, "")
 		r.saveSession()
 		return false
 	}
@@ -289,7 +311,7 @@ func (r *Runner) executeSingle(i int, cmd *types.Command) bool {
 	// 4. DOCUMENTATION (non-fatal)
 	if !r.NoDocs {
 		cmd.Status = types.StatusDocumenting
-		r.sendUpdate(i, types.StatusDocumenting, cmd.Output)
+		r.sendUpdate(i, types.StatusDocumenting, cmd.Output, "")
 		r.saveSession()
 
 		docPrompt := "Review the changes just made in this project. Update the following documentation files to reflect these changes:\n\n1. CLAUDE.md — This is the project memory file for Claude Code. Update it with any new conventions, architecture decisions, file structure changes, dependencies added, or important patterns established by the recent changes. Create the file if it doesn't exist. Keep it concise and useful as a reference for future Claude Code sessions.\n\n2. README.md — Update the user-facing documentation to reflect any new features, usage changes, API changes, or configuration options introduced by the recent changes. Create the file if it doesn't exist. Do not remove existing content unless it's outdated due to the changes.\n\nOnly update sections relevant to the recent changes. Do not rewrite unrelated sections. If no documentation updates are needed, make no changes.\n\nRecent task that was executed: " + cmd.Prompt
@@ -297,43 +319,44 @@ func (r *Runner) executeSingle(i int, cmd *types.Command) bool {
 		attemptStdout.WriteString(docResult.Stdout)
 		attemptStderr.WriteString(docResult.Stderr)
 		if docErr != nil {
-			cmd.Output = cmd.Output + "\n═══ DOCUMENTATION ═══\n" + fmt.Sprintf("[warn] documentation update failed: %v", docErr)
+			cmd.Output += "\n═══ DOCUMENTATION ═══\n" + fmt.Sprintf("[warn] documentation update failed: %v", docErr)
 			updateLastAttempt("Documenting", docResult.ExitCode)
 		} else {
-			cmd.Output = cmd.Output + "\n═══ DOCUMENTATION ═══\n" + docOutput
+			cmd.Output += "\n═══ DOCUMENTATION ═══\n" + docOutput
 			updateLastAttempt("", 0)
 		}
-		r.sendUpdate(i, types.StatusDocumenting, cmd.Output)
+		r.sendUpdate(i, types.StatusDocumenting, cmd.Output, "")
 	}
 
 	// 5. COMMIT
 	cmd.Status = types.StatusCommitting
-	r.sendUpdate(i, types.StatusCommitting, cmd.Output)
+	r.sendUpdate(i, types.StatusCommitting, cmd.Output, "")
 	r.saveSession()
 
 	commitOutput, commitResult, commitErr := r.runClaude(i, "Git add all changes, commit with a concise meaningful commit message describing what was done, and push to origin. Do not ask for confirmation.")
 	attemptStdout.WriteString(commitResult.Stdout)
 	attemptStderr.WriteString(commitResult.Stderr)
 	if commitErr != nil {
-		cmd.Output = cmd.Output + "\n" + fmt.Sprintf("[warn] git commit/push failed: %v", commitErr)
+		cmd.Output += "\n" + fmt.Sprintf("[warn] git commit/push failed: %v", commitErr)
 		updateLastAttempt("Committing", commitResult.ExitCode)
 	} else {
-		cmd.Output = cmd.Output + "\n" + commitOutput
+		cmd.Output += "\n" + commitOutput
 		updateLastAttempt("", 0)
 	}
 
 	cmd.Status = types.StatusSuccess
-	r.sendUpdate(i, types.StatusSuccess, cmd.Output)
+	r.sendUpdate(i, types.StatusSuccess, cmd.Output, "")
 	r.saveSession()
 	return true
 }
 
-func (r *Runner) sendUpdate(index int, status types.CommandStatus, output string) {
+func (r *Runner) sendUpdate(index int, status types.CommandStatus, output string, detail string) {
 	if r.program != nil {
 		r.program.Send(StatusUpdateMsg{
-			CmdIndex: index,
-			Status:   status,
-			Output:   output,
+			CmdIndex:     index,
+			Status:       status,
+			Output:       output,
+			StatusDetail: detail,
 		})
 	}
 }

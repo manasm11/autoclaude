@@ -31,6 +31,7 @@ go test ./...
 - **Exit code extraction**: On error, the exit code is extracted via type assertion to `*exec.ExitError`. If the error is not an `ExitError` (e.g. process couldn't start), exit code is `-1`.
 - `runClaude` and `runVerify` are thin wrappers around `runCommandStreaming`. They return `(string, CommandResult, error)` — the `CommandResult` carries separated stdout/stderr/exit code for attempt logging.
 - `captureGitContext()` runs `git branch --show-current` and `git status --porcelain` via `exec.Command` (not streaming). Errors are silently ignored (returns empty strings if git is unavailable).
+- **`sendUpdate` signature**: `sendUpdate(index, status, output, detail)` — the `detail` string (e.g. "Attempt 2/3") is passed as `StatusUpdateMsg.StatusDetail` and displayed next to the spinner in the TUI. Pass `""` for non-attempt-tracked steps (documenting, committing, success, final failure).
 
 ### Attempt logging
 
@@ -41,9 +42,17 @@ go test ./...
 - Pre-attempt context: each iteration captures git branch/status via `captureGitContext()` and records WorkDir before any steps run.
 - Stdout/stderr from each step (`runClaude`/`runVerify`) are accumulated into per-attempt `strings.Builder` buffers, then snapshotted into the AttemptLog at finalization.
 
+### Retry mechanism (internal/runner/runner.go)
+
+- **MaxRetries means total attempts**, not additional retries. `MaxRetries=3` means at most 3 executions. The loop runs `for cmd.Attempts = 1; cmd.Attempts <= cmd.MaxRetries; cmd.Attempts++`.
+- **Retry-eligible failures** (Planning, Running, Verifying): increment attempts, check `cmd.Attempts < cmd.MaxRetries`, and if retries remain: append a retry separator to `cmd.Output` (`═══ RETRY N/M ═══ (previous attempt failed at: <step>, exit code: <code>)`), set `StatusRetrying`, sleep 2s (interruptible via `r.ctx.Done()`), clear `cmd.PlanOutput`, and `continue` to restart from Planning.
+- **Non-fatal steps** (Documenting, Committing): failures are logged as warnings in output but do NOT trigger retries. The command still reaches `StatusSuccess`.
+- **Verification failure retries the full cycle** — `cmd.PlanOutput` is cleared so the next attempt starts from Planning, not just re-verification.
+- **Attempt detail in TUI**: `StatusUpdateMsg.StatusDetail` carries "Attempt N/M" for retry-eligible steps. The TUI displays this next to the spinner via `model.statusDetail`.
+
 ### Execution flow
 
-Each command goes through: Pending -> Planning -> Running -> Verifying -> Documenting -> Committing -> Success. On failure, it retries from Planning with a fresh plan up to `max_retries` times.
+Each command goes through: Pending -> Planning -> Running -> Verifying -> Documenting -> Committing -> Success. On failure, it retries from Planning with a fresh plan up to `max_retries` times (where `max_retries` is the total attempt count, not additional retries).
 
 ### Dependencies
 
