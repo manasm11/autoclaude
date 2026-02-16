@@ -68,6 +68,14 @@ The old retry-from-planning loop has been replaced with an auto-fix system. On f
 - **Non-fatal steps** (Documenting, Committing): unchanged — failures are warnings, never trigger fix attempts.
 - **TUI fix detail**: `StatusUpdateMsg.StatusDetail` carries `"Fix N/M"` during fix attempts. The TUI displays this next to the spinner.
 
+### TUI auto-fix display (internal/tui/model.go)
+
+- **Status flow breadcrumb**: `renderStatusFlow(current, fixAttempts)` renders a colored breadcrumb in the execution view header: `Plan → Run → Verify → [Fix → Verify]* → Docs → Commit`. Completed steps are green, the active step is bold white, future steps are dim. The `Fix → Verify` cycle only appears if `fixAttempts > 0` or `current == StatusFixing`. Uses `isStatusBefore()` with a status→order map to determine coloring.
+- **Enhanced fixing view**: When `cmd.Status == StatusFixing`, the execution view shows: (1) what failed — e.g. "Verification failed (exit code 1)" via `capitalize(cmd.LastFailedStep)`, (2) last 10 lines of `cmd.LastStderr` via `lastNLines(s, 10)`, (3) fix attempt counter "Fix attempt N/M" styled with `statusFixing`. Falls back to `maxFix = 3` if `cmd.MaxRetries < 1`.
+- **Failure panel**: `viewFailurePanel()` header shows "Command failed after N auto-fix attempt(s)" when `cmd.FixAttempts > 0`. When `len(cmd.AttemptLogs) > 1`, renders a per-attempt history table: attempt number, failed step (or "success"), exit code, and duration.
+- **Queue icon**: `statusIcon(StatusFixing)` returns `⚡` (U+26A1). Previously was `↻` (U+21BB).
+- **Helper functions**: `capitalize(s)` uppercases first char. `lastNLines(s, n)` returns last N lines of a string. `isStatusBefore(a, b)` compares status ordering via a map. `renderStatusFlow(current, fixAttempts)` builds the colored breadcrumb string.
+
 ### Failure reporting (internal/runner/runner.go)
 
 - **`writeFailureReport(cmd)`**: Formats a timestamped failure report header (prompt truncated to 100 chars, RFC3339 timestamp, box-drawing separators) + `cmd.FormatFailureReport()` body. Appends to `autoclaude-error.log` in `r.WorkDir` via `os.OpenFile` with `O_APPEND|O_CREATE|O_WRONLY`. File write errors are non-fatal (warning appended to `cmd.Output`). Returns the full report string.

@@ -165,7 +165,7 @@ autoclaude -c "Fix the bug::go test ./..." --auto-run
 
 ## Command lifecycle
 
-Each command moves through a sequence of states:
+Each command moves through a sequence of states. During execution, a colored status breadcrumb (`Plan → Run → Verify → [Fix → Verify]* → Docs → Commit`) is shown in the TUI header with completed steps in green, the active step in bold white, and future steps dimmed.
 
 ```
 Pending → Planning → Running → Verifying → Documenting → Committing → Success
@@ -179,7 +179,7 @@ Pending → Planning → Running → Verifying → Documenting → Committing �
 | **Planning** | Claude is generating a step-by-step implementation plan (read-only, no file changes) |
 | **Running** | Claude Code is executing the implementation plan |
 | **Verifying** | The `verify` shell command is running (skipped if no verify command is set) |
-| **Fixing** | Claude is auto-fixing a failure by analyzing the error and making targeted corrections |
+| **Fixing** | Claude is auto-fixing a failure — the TUI shows what failed, condensed stderr (last 10 lines), and the current fix attempt counter |
 | **Documenting** | Claude is updating CLAUDE.md and README.md to reflect the changes (non-fatal if it fails) |
 | **Committing** | Claude is committing and pushing the changes via git |
 | **Success** | Command completed and changes were committed |
@@ -344,7 +344,9 @@ Each entry includes:
 The log file is included in `.gitignore` by default.
 
 When execution finishes with failures, the TUI shows a failure panel with:
+- "Command failed after N auto-fix attempt(s)" header (when fix attempts were made)
 - Command number, prompt, attempt count, last failed step, and exit code
+- Per-attempt history showing each attempt's failed step, exit code, and duration
 - Scrollable last-attempt stderr
 - Press `l` to expand the full failure report showing all attempts with stdout/stderr
 

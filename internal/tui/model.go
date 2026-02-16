@@ -673,8 +673,12 @@ func (m Model) viewFailurePanel() string {
 
 	cmd := m.commands[m.failedCmdIndex]
 
-	// Section header
-	b.WriteString(statusFailed.Render("═══ FAILURE DETAILS ═══"))
+	// Section header — highlight auto-fix attempts
+	if cmd.FixAttempts > 0 {
+		b.WriteString(statusFailed.Render(fmt.Sprintf("═══ Command failed after %d auto-fix attempt(s) ═══", cmd.FixAttempts)))
+	} else {
+		b.WriteString(statusFailed.Render("═══ FAILURE DETAILS ═══"))
+	}
 	b.WriteString("\n\n")
 
 	// Info fields
@@ -692,6 +696,21 @@ func (m Model) viewFailurePanel() string {
 		b.WriteString(fmt.Sprintf("  Exit code:   %d\n", lastAttempt.ExitCode))
 	} else {
 		b.WriteString("  No attempt data available\n")
+	}
+
+	// Per-attempt summary
+	if len(cmd.AttemptLogs) > 1 {
+		b.WriteString("\n")
+		b.WriteString(helpStyle.Render("  Attempt history:"))
+		b.WriteString("\n")
+		for _, a := range cmd.AttemptLogs {
+			step := a.FailedStep
+			if step == "" {
+				step = "success"
+			}
+			dur := a.Duration.Round(time.Millisecond).String()
+			b.WriteString(fmt.Sprintf("    #%d  %s  exit=%d  %s\n", a.AttemptNumber, step, a.ExitCode, helpStyle.Render(dur)))
+		}
 	}
 
 	b.WriteString("\n")
@@ -1135,6 +1154,11 @@ func (m Model) viewRunningLive() string {
 		b.WriteString(promptLabelStyle.Render("Prompt: "))
 		b.WriteString(truncate(cmd.Prompt, 200))
 		b.WriteString("\n")
+
+		// Status flow breadcrumb
+		b.WriteString(renderStatusFlow(cmd.Status, cmd.FixAttempts))
+		b.WriteString("\n")
+
 		b.WriteString(m.spinner.View())
 		b.WriteString(" ")
 		b.WriteString(styledStatus(cmd.Status))
@@ -1142,7 +1166,31 @@ func (m Model) viewRunningLive() string {
 			b.WriteString("  ")
 			b.WriteString(helpStyle.Render(m.statusDetail))
 		}
-		b.WriteString("\n\n")
+		b.WriteString("\n")
+
+		// Enhanced fixing view: show what failed, condensed stderr, fix attempt count
+		if cmd.Status == types.StatusFixing {
+			b.WriteString("\n")
+			if cmd.LastFailedStep != "" {
+				failedLabel := capitalize(cmd.LastFailedStep)
+				b.WriteString(statusFailed.Render(fmt.Sprintf("  %s failed (exit code %d)", failedLabel, cmd.LastExitCode)))
+				b.WriteString("\n")
+			}
+			if cmd.LastStderr != "" {
+				condensed := lastNLines(cmd.LastStderr, 10)
+				for _, line := range strings.Split(condensed, "\n") {
+					b.WriteString(outputStyle.Render("    " + line))
+					b.WriteString("\n")
+				}
+			}
+			maxFix := cmd.MaxRetries
+			if maxFix < 1 {
+				maxFix = 3
+			}
+			b.WriteString(statusFixing.Render(fmt.Sprintf("  Fix attempt %d/%d", cmd.FixAttempts, maxFix)))
+			b.WriteString("\n")
+		}
+		b.WriteString("\n")
 	}
 
 	// Output viewport
@@ -1294,7 +1342,7 @@ func statusIcon(s types.CommandStatus) string {
 	case types.StatusFailed:
 		return "\u2717" // ✗
 	case types.StatusFixing:
-		return "\u21bb" // ↻
+		return "\u26a1" // ⚡
 	default:
 		return "?"
 	}
@@ -1328,4 +1376,82 @@ func truncate(s string, max int) string {
 		return s
 	}
 	return s[:max-3] + "..."
+}
+
+func capitalize(s string) string {
+	if s == "" {
+		return s
+	}
+	return strings.ToUpper(s[:1]) + s[1:]
+}
+
+func lastNLines(s string, n int) string {
+	lines := strings.Split(s, "\n")
+	if len(lines) <= n {
+		return s
+	}
+	return strings.Join(lines[len(lines)-n:], "\n")
+}
+
+// isStatusBefore returns true if a is before b in the execution flow order.
+func isStatusBefore(a, b types.CommandStatus) bool {
+	order := map[types.CommandStatus]int{
+		types.StatusPending:     0,
+		types.StatusPlanning:    1,
+		types.StatusRunning:     2,
+		types.StatusVerifying:   3,
+		types.StatusFixing:      4,
+		types.StatusDocumenting: 5,
+		types.StatusCommitting:  6,
+		types.StatusSuccess:     7,
+		types.StatusFailed:      7,
+	}
+	return order[a] < order[b]
+}
+
+// renderStatusFlow renders a breadcrumb like: Plan → Run → Verify → [Fix → Verify]* → Docs → Commit
+func renderStatusFlow(current types.CommandStatus, fixAttempts int) string {
+	type step struct {
+		label  string
+		status types.CommandStatus
+	}
+
+	greenStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#00FF00"))
+	activeStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#FFFFFF"))
+	futureStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#555555"))
+	sepStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#555555"))
+
+	steps := []step{
+		{"Plan", types.StatusPlanning},
+		{"Run", types.StatusRunning},
+		{"Verify", types.StatusVerifying},
+	}
+
+	// Insert fix→verify cycles if we've had fix attempts
+	if fixAttempts > 0 || current == types.StatusFixing {
+		steps = append(steps, step{"Fix", types.StatusFixing})
+		steps = append(steps, step{"Verify", types.StatusVerifying})
+	}
+
+	steps = append(steps,
+		step{"Docs", types.StatusDocumenting},
+		step{"Commit", types.StatusCommitting},
+	)
+
+	sep := sepStyle.Render(" → ")
+	var parts []string
+
+	for _, s := range steps {
+		var rendered string
+		if s.status == current {
+			rendered = activeStyle.Render(s.label)
+		} else if isStatusBefore(s.status, current) {
+			rendered = greenStyle.Render(s.label)
+		} else {
+			rendered = futureStyle.Render(s.label)
+		}
+		parts = append(parts, rendered)
+	}
+
+	return strings.Join(parts, sep)
 }
