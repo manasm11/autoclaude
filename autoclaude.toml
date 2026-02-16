@@ -1,108 +1,182 @@
-# autoclaude.toml — Fix failure logging & retry mechanism
-# Run from the autoclaude project root: autoclaude
+# autoclaude.toml — Add self-healing auto-fix retry to autoclaude
+# Run from autoclaude project root: autoclaude
 
 max_retries = 3
 update_docs = true
 
-# ── Step 1: Separate stdout/stderr capture ──────────────
-
-[[command]]
-prompt = """
-In internal/runner/runner.go, refactor all os/exec command executions (claude invocations and verify commands) to capture stdout and stderr separately using bytes.Buffer instead of CombinedOutput. For every exec.Cmd:
-- Set cmd.Stdout = &stdoutBuf
-- Set cmd.Stderr = &stderrBuf
-- After execution, capture the exit code using a type assertion to *exec.ExitError (if err != nil, check if exitErr, ok := err.(*exec.ExitError); ok, then use exitErr.ExitCode(), otherwise use -1)
-- Store both stdout and stderr separately for later use
-Do not change the overall execution flow yet, just fix the output capture plumbing.
-"""
-verify = "go build ./..."
-
-# ── Step 2: Add AttemptLog type ──────────────────────────
+# ── Step 1: Add StatusFixing and auto-fix types ─────────
 
 [[command]]
 prompt = """
 In internal/types/types.go:
-1. Add an AttemptLog struct with fields: AttemptNumber int, StartedAt time.Time, EndedAt time.Time, Duration time.Duration, FailedStep string, Command string, ExitCode int, Stdout string, Stderr string, WorkDir string, GitBranch string, GitStatus string
-2. Add AttemptLogs []AttemptLog field to the Command struct
-3. Add a method FormatFailureReport() string on Command that formats all attempt logs into a readable debug report showing each attempt with its details, stdout, and stderr
-4. Update internal/session/session.go SessionCommand to include AttemptLogs so they survive session resume
+
+1. Add a new StatusFixing CommandStatus constant (place it after StatusRetrying).
+   Update the String() method to return "Fixing".
+
+2. Add these fields to the Command struct:
+   - LastFailedStep string — which step failed: "planning", "execution", or "verification"
+   - LastExitCode int — exit code of the failed process
+   - LastStderr string — stderr from the failed step
+   - LastStdout string — stdout from the failed step
+   - FixAttempts int — number of auto-fix attempts made so far
+
+3. Add a method BuildFixPrompt() string on Command that generates a comprehensive prompt for Claude to fix the issue. The prompt should include:
+   - The original task prompt
+   - Which step failed (planning/execution/verification)
+   - The exit code
+   - The full stderr output
+   - The full stdout output
+   - The plan that was used (if available from PlanOutput)
+   - Clear instruction: "The above command failed. Analyze the error output carefully and fix the issue. Do not start from scratch — identify what went wrong and make targeted fixes to resolve the error."
+
+4. Remove any existing plain retry logic references from types if present — retries are now always auto-fix attempts.
 """
 verify = "go build ./..."
 
-# ── Step 3: Populate AttemptLogs in runner ───────────────
+# ── Step 2: Replace retry logic with auto-fix in runner ──
 
 [[command]]
 prompt = """
-In internal/runner/runner.go, update the execution loop to populate AttemptLog entries for every attempt of every command:
-1. Before each attempt starts, record StartedAt, AttemptNumber, and WorkDir
-2. Before each attempt, capture git context by running `git branch --show-current` and `git status --porcelain` using exec.Command (ignore errors, just store empty string if git not available)
-3. Record the exact shell command string being run in the log
-4. After each step (planning/execution/verification/documenting/committing) completes or fails, record EndedAt, Duration, ExitCode, Stdout, Stderr, and FailedStep
-5. Append the AttemptLog to cmd.AttemptLogs after every attempt regardless of success or failure
-6. Make sure the captured stdout from the separate buffer (from step 1) flows into the AttemptLog.Stdout and stderr into AttemptLog.Stderr
-"""
-verify = "go build ./..."
+In internal/runner/runner.go, completely replace the existing retry mechanism with an auto-fix loop. The new flow for each command is:
 
-# ── Step 4: Fix retry mechanism ──────────────────────────
+EXECUTION FLOW:
+1. StatusPlanning → run claude to generate plan
+2. StatusRunning → run claude to execute plan
+3. StatusVerifying → run verify command (if set)
+4. If ANY of the above steps fail:
+   a. Record failure details in cmd: LastFailedStep, LastExitCode, LastStderr, LastStdout
+   b. Increment cmd.FixAttempts
+   c. If cmd.FixAttempts < cmd.MaxRetries:
+      - Set status to StatusFixing, send StatusUpdateMsg
+      - Sleep 2 seconds
+      - Run claude with the auto-fix prompt: `claude --dangerously-skip-permissions -p "<cmd.BuildFixPrompt()>"`
+      - The fix prompt tells Claude what failed and asks it to fix the issue in the codebase
+      - After the fix claude call completes (regardless of its own exit code), re-run the VERIFICATION step only (not the full planning+execution cycle again, since the fix was applied directly)
+      - If verification passes → StatusSuccess (proceed to documenting/committing)
+      - If verification fails again → loop back to step 4a (another fix attempt)
+      - If no verify command is set, assume the fix succeeded after the fix claude call returns exit code 0
+   d. If cmd.FixAttempts >= cmd.MaxRetries → StatusFailed, stop execution
 
-[[command]]
-prompt = """
-Audit and fix the retry mechanism in internal/runner/runner.go. The correct behavior must be:
+2. Remove the old StatusRetrying state entirely from the runner flow — it's replaced by StatusFixing.
 
-1. MaxRetries means total attempts, not additional retries. So MaxRetries=3 means the command runs at most 3 times.
-2. When any step fails (planning, execution, or verification):
-   - Increment cmd.Attempts
-   - If cmd.Attempts < cmd.MaxRetries: set StatusRetrying, send StatusUpdateMsg, sleep 2 seconds, clear cmd.PlanOutput (force fresh plan), then restart from StatusPlanning
-   - If cmd.Attempts >= cmd.MaxRetries: set StatusFailed, stop execution
-3. Verification failure must retry the ENTIRE cycle (planning + execution + verification), not just re-run verification
-4. Documenting and committing failures are non-fatal and should NOT trigger retries
-5. On retry, append a separator to cmd.Output: "\\n═══ RETRY N/M ═══ (previous attempt failed at: <step>, exit code: <code>)\\n"
-6. Show "Attempt N/M" in the StatusUpdateMsg so the TUI can display it next to the spinner
-7. Fix any off-by-one errors in the retry counter
+3. Append clear separators to cmd.Output for each fix attempt:
+   "\\n═══ FIX ATTEMPT N/M ═══\\n"
+   "Failed step: <step> | Exit code: <code>\\n"
+   "Stderr: <last 50 lines of stderr>\\n"
+   "Fix output: <claude fix output>\\n"
 
-Trace through the retry flow carefully and make sure every code path sends the correct StatusUpdateMsg to the TUI.
+4. The fix attempt should capture its own stdout/stderr and add an AttemptLog entry with FailedStep set to "auto-fix".
+
+5. Important: after a successful fix, clear PlanOutput and don't re-plan. The fix was applied directly to the code, so go straight to verification.
 """
 verify = "go vet ./... && go build ./..."
 
-# ── Step 5: Failure report file and TUI ──────────────────
+# ── Step 3: Update TUI for StatusFixing ──────────────────
 
 [[command]]
 prompt = """
-Add failure report output to autoclaude:
+Update the TUI in internal/tui/ to support the new auto-fix flow:
 
-1. In internal/runner/runner.go, when a command permanently fails (exhausted retries):
-   - Call cmd.FormatFailureReport() to get the formatted report
-   - Write it to autoclaude-error.log in the working directory (append mode, don't overwrite)
-   - Prefix each report entry with a timestamp header:
-     ════════════════════════════════════════
-     FAILURE REPORT — <timestamp>
-     Command: "<prompt first 100 chars>"
-     ════════════════════════════════════════
-   - Include the report content in the ExecutionErrorMsg sent to TUI
+1. Remove StatusRetrying references from the TUI — replace with StatusFixing everywhere.
 
-2. In the TUI execution view (internal/tui/), when a command fails:
-   - Show a failure panel with: command index, prompt, total attempts, which step failed last, last exit code
-   - Show last attempt's stderr (scrollable)
-   - Add keybinding 'l' to toggle expanded view showing all attempts with full stdout/stderr
-   - Show a note: "Full report written to autoclaude-error.log"
+2. Add color for StatusFixing: orange/yellow with spinner, display text "Fixing (attempt N/M)"
 
-3. Add autoclaude-error.log to .gitignore
+3. In the execution view, when StatusFixing is active, show:
+   - "Auto-fixing..." with spinner
+   - What failed: "Verification failed (exit code 1)"
+   - A condensed view of the error (last 10 lines of stderr)
+   - Current fix attempt: "Fix attempt 2/3"
 
-4. Update README.md to document the failure logging behavior and keybindings.
+4. Update the status flow in the execution view header:
+   Planning → Running → Verifying → [Fixing → Verifying]* → Documenting → Committing → Success
+
+   Where [Fixing → Verifying]* can repeat up to MaxRetries times.
+
+5. In the failure panel (when all fix attempts exhausted), show:
+   - "Command failed after N auto-fix attempts"
+   - Summary of each attempt: what was tried, what error persisted
+   - The final stderr output
+
+6. Update the queue view status indicators:
+   - Fixing: orange ⚡ symbol
 """
 verify = "go build ./..."
 
-# ── Step 6: Session resume respects attempt history ──────
+# ── Step 4: Update session for auto-fix state ────────────
 
 [[command]]
 prompt = """
-Fix session resume to properly handle retry history:
+Update internal/session/session.go to handle the auto-fix state:
 
-1. In internal/session/session.go, make sure AttemptLogs are serialized and deserialized in the session JSON
-2. When resuming a failed command, set cmd.Attempts = len(cmd.AttemptLogs) so the retry budget accounts for previous attempts
-3. Do NOT reset Attempts to 0 on resume — if a command failed 2/3 times before interruption, it should only get 1 more attempt on resume
-4. Add a --reset-attempts flag that forces Attempts back to 0 on resume, giving the command a full fresh retry budget (useful after manually fixing an issue)
-5. Update the StateResume view to show attempt history: "Command 3: Failed (2/3 attempts used)"
-6. Update README.md to document --reset-attempts flag
+1. Add to SessionCommand: LastFailedStep string, LastExitCode int, LastStderr string, LastStdout string, FixAttempts int
+
+2. When resuming a command that was in StatusFixing:
+   - Restore FixAttempts from the session
+   - Re-attempt the fix from where it left off (don't reset fix counter)
+   - The fix attempt budget on resume = MaxRetries - FixAttempts
+
+3. Remove any references to the old StatusRetrying from session handling.
+
+4. When --reset-attempts flag is used on resume, reset FixAttempts to 0 (giving full fix budget).
+"""
+verify = "go build ./..."
+
+# ── Step 5: Add TOML option to disable auto-fix ─────────
+
+[[command]]
+prompt = """
+Add configuration options for auto-fix behavior:
+
+1. In the TOML config, add global option:
+   - auto_fix = true  (default: true, set to false to fail immediately without fix attempts)
+
+2. Add per-command override in [[command]]:
+   - auto_fix = false  (overrides global for this specific command)
+
+3. Add CLI flag --no-auto-fix that disables auto-fix globally (equivalent to auto_fix = false).
+
+4. In internal/config/config.go:
+   - Add AutoFix *bool to ConfigFile
+   - Add AutoFix *bool to ConfigCommand
+   - Default to true when not specified
+
+5. In internal/types/types.go:
+   - Add AutoFix bool field to Command struct (default true)
+
+6. In internal/runner/runner.go:
+   - Check cmd.AutoFix before attempting fix. If false, go directly to StatusFailed on any failure.
+
+7. Update the sample TOML generated by `autoclaude init` to include:
+   # auto_fix = true  # auto-fix failures using Claude (default: true)
+
+8. Update README.md to document:
+   - The auto-fix feature and how it works
+   - The fix flow: fail → feed error to Claude → re-verify → repeat
+   - auto_fix TOML option (global and per-command)
+   - --no-auto-fix flag
+   - How MaxRetries controls fix attempts
+
+9. Run go vet and go mod tidy.
+"""
+verify = "go vet ./... && go build ./..."
+
+# ── Step 6: Remove old retry references ──────────────────
+
+[[command]]
+prompt = """
+Clean up the entire autoclaude codebase to remove all traces of the old plain retry mechanism:
+
+1. Search the entire codebase for StatusRetrying — remove it from types.go, any switch cases, any TUI rendering, any session handling. It should not exist anywhere.
+
+2. Search for any "retry" wording in user-facing strings and update to "fix attempt" or "auto-fix" as appropriate. For example:
+   - "Retrying..." → "Auto-fixing..."
+   - "retry limit" → "fix attempt limit"
+   - "max_retries" TOML/flag name stays the same (it's the budget for fix attempts now, renaming would break configs)
+
+3. Make sure CLAUDE.md and README.md consistently describe the auto-fix behavior, not "retry".
+
+4. Run go vet, go build, go mod tidy.
+
+5. Review all files touched and make sure there are no compile errors, unused imports, or dead code.
 """
 verify = "go vet ./... && go build ./..."

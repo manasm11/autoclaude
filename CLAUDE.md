@@ -17,7 +17,7 @@ go test ./...
 
 - `main.go` — CLI entry point (flag parsing, config loading, TUI launch)
 - `internal/runner/` — Command execution engine
-- `internal/types/` — Shared types (`Command`, `CommandStatus`, `SessionCommand`, `AttemptLog`)
+- `internal/types/` — Shared types (`Command`, `CommandStatus`, `SessionCommand`, `AttemptLog`, `BuildFixPrompt`)
 - `internal/session/` — Session persistence (`.autoclaude-session.json`)
 - `internal/tui/` — BubbleTea TUI views (input, queue, running, resume)
 - `internal/config/` — TOML config parsing
@@ -42,7 +42,18 @@ go test ./...
 - Pre-attempt context: each iteration captures git branch/status via `captureGitContext()` and records WorkDir before any steps run.
 - Stdout/stderr from each step (`runClaude`/`runVerify`) are accumulated into per-attempt `strings.Builder` buffers, then snapshotted into the AttemptLog at finalization.
 
-### Retry mechanism (internal/runner/runner.go)
+### Auto-fix mechanism (in progress)
+
+The retry mechanism is being replaced with an auto-fix system. The type-level groundwork is in place (`internal/types/types.go`); the runner integration is planned for a future step.
+
+#### Type-level support (internal/types/types.go)
+
+- **`StatusFixing`** (iota 9): New command status for when Claude is auto-fixing a failure. Appended after `StatusRetrying` — no existing iota values shift.
+- **Auto-fix fields on `Command`**: `LastFailedStep` (string: `"planning"`, `"execution"`, or `"verification"`), `LastExitCode` (int), `LastStderr`/`LastStdout` (string), `FixAttempts` (int counter). These track the most recent failure and are replaced (not accumulated) on each failure. Zero values mean "no failure recorded".
+- **`BuildFixPrompt()`**: Method on `*Command` that constructs a prompt for Claude to fix the issue. Includes: original task prompt, failed step, exit code, plan (if available), stdout, stderr, and a clear instruction to make targeted fixes. Conditionally omits empty sections (PlanOutput, LastStdout, LastStderr).
+- **`StatusRetrying`** is still present in types for backward compatibility — will be removed in a future cleanup step after runner and TUI are migrated to use `StatusFixing`.
+
+#### Current retry mechanism (internal/runner/runner.go) — to be replaced
 
 - **MaxRetries means total attempts**, not additional retries. `MaxRetries=3` means at most 3 executions. The loop runs `for cmd.Attempts = 1; cmd.Attempts <= cmd.MaxRetries; cmd.Attempts++`.
 - **Retry-eligible failures** (Planning, Running, Verifying): increment attempts, check `cmd.Attempts < cmd.MaxRetries`, and if retries remain: append a retry separator to `cmd.Output` (`═══ RETRY N/M ═══ (previous attempt failed at: <step>, exit code: <code>)`), set `StatusRetrying`, sleep 2s (interruptible via `r.ctx.Done()`), clear `cmd.PlanOutput`, and `continue` to restart from Planning.
@@ -65,7 +76,7 @@ go test ./...
 
 ### Execution flow
 
-Each command goes through: Pending -> Planning -> Running -> Verifying -> Documenting -> Committing -> Success. On failure, it retries from Planning with a fresh plan up to `max_retries` times (where `max_retries` is the total attempt count, not additional retries).
+Each command goes through: Pending -> Planning -> Running -> Verifying -> Documenting -> Committing -> Success. On failure, the planned auto-fix flow is: fail -> StatusFixing -> run Claude with `BuildFixPrompt()` -> re-verify -> repeat up to `max_retries` times. The runner still uses the old retry-from-Planning approach until the auto-fix runner integration is completed.
 
 ### Dependencies
 

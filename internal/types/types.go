@@ -19,6 +19,7 @@ const (
 	StatusSuccess                         // 6
 	StatusFailed                          // 7
 	StatusRetrying                        // 8
+	StatusFixing                          // 9
 )
 
 // String returns the human-readable label for a CommandStatus value.
@@ -33,6 +34,7 @@ func (s CommandStatus) String() string {
 		"Success",
 		"Failed",
 		"Retrying",
+		"Fixing",
 	}
 	if int(s) < 0 || int(s) >= len(labels) {
 		return "Unknown"
@@ -64,8 +66,13 @@ type Command struct {
 	Status     CommandStatus // current execution status
 	Output     string        // captured stdout/stderr
 	PlanOutput string        // output from the planning phase
-	Attempts    int           // number of attempts made
-	AttemptLogs []AttemptLog  // detailed log of each attempt for debugging
+	Attempts       int           // number of attempts made
+	AttemptLogs    []AttemptLog  // detailed log of each attempt for debugging
+	LastFailedStep string        // which step failed: "planning", "execution", or "verification"
+	LastExitCode   int           // exit code of the failed process
+	LastStderr     string        // stderr from the failed step
+	LastStdout     string        // stdout from the failed step
+	FixAttempts    int           // number of auto-fix attempts made so far
 }
 
 // NewCommand creates a new Command with sensible defaults.
@@ -121,6 +128,31 @@ func (c *Command) FormatFailureReport() string {
 	return b.String()
 }
 
+// BuildFixPrompt generates a comprehensive prompt for Claude to fix a failed step.
+func (c *Command) BuildFixPrompt() string {
+	var b strings.Builder
+
+	fmt.Fprintf(&b, "Original task:\n%s\n\n", c.Prompt)
+	fmt.Fprintf(&b, "Failed step: %s\n", c.LastFailedStep)
+	fmt.Fprintf(&b, "Exit code: %d\n\n", c.LastExitCode)
+
+	if c.PlanOutput != "" {
+		fmt.Fprintf(&b, "Plan that was used:\n%s\n\n", c.PlanOutput)
+	}
+
+	if c.LastStdout != "" {
+		fmt.Fprintf(&b, "Stdout:\n%s\n\n", c.LastStdout)
+	}
+
+	if c.LastStderr != "" {
+		fmt.Fprintf(&b, "Stderr:\n%s\n\n", c.LastStderr)
+	}
+
+	b.WriteString("The above command failed. Analyze the error output carefully and fix the issue. Do not start from scratch — identify what went wrong and make targeted fixes to resolve the error.")
+
+	return b.String()
+}
+
 // ParseCommandStatus converts a string back to a CommandStatus.
 // Returns StatusPending for unrecognized values.
 func ParseCommandStatus(s string) CommandStatus {
@@ -143,6 +175,8 @@ func ParseCommandStatus(s string) CommandStatus {
 		return StatusFailed
 	case "Retrying":
 		return StatusRetrying
+	case "Fixing":
+		return StatusFixing
 	default:
 		return StatusPending
 	}

@@ -1,6 +1,6 @@
 # autoclaude
 
-A terminal UI for running a series of [Claude Code](https://docs.anthropic.com/en/docs/claude-code) commands with optional verification and automatic retry support. Each command goes through a two-step plan-then-execute flow: Claude first generates a detailed implementation plan (read-only, no file changes), then executes that plan in a second invocation. Queue up multiple prompts, attach shell-based verification commands, and let autoclaude execute them sequentially with git commit/push on success.
+A terminal UI for running a series of [Claude Code](https://docs.anthropic.com/en/docs/claude-code) commands with optional verification and automatic error fixing. Each command goes through a two-step plan-then-execute flow: Claude first generates a detailed implementation plan (read-only, no file changes), then executes that plan in a second invocation. Queue up multiple prompts, attach shell-based verification commands, and let autoclaude execute them sequentially with git commit/push on success.
 
 ## Prerequisites
 
@@ -169,8 +169,8 @@ Each command moves through a sequence of states:
 
 ```
 Pending → Planning → Running → Verifying → Documenting → Committing → Success
-                   ↘         ↘            ↘              ↘           ↘
-                    Retrying ─────────────────────────→ Failed
+                   ↘         ↘            ↘
+                    Fixing → Verifying ──→ Failed
 ```
 
 | State | Description |
@@ -179,20 +179,18 @@ Pending → Planning → Running → Verifying → Documenting → Committing �
 | **Planning** | Claude is generating a step-by-step implementation plan (read-only, no file changes) |
 | **Running** | Claude Code is executing the implementation plan |
 | **Verifying** | The `verify` shell command is running (skipped if no verify command is set) |
+| **Fixing** | Claude is auto-fixing a failure by analyzing the error and making targeted corrections |
 | **Documenting** | Claude is updating CLAUDE.md and README.md to reflect the changes (non-fatal if it fails) |
 | **Committing** | Claude is committing and pushing the changes via git |
 | **Success** | Command completed and changes were committed |
-| **Failed** | All retry attempts exhausted — execution stops |
-| **Retrying** | Claude or verification failed; trying again |
+| **Failed** | All fix attempts exhausted — execution stops |
 
-### Retry behavior
+### Retry and auto-fix behavior
 
-- `max_retries` means **total attempts**, not additional retries. `max_retries = 3` means the command runs at most 3 times.
-- When Claude or the verification step fails, the command enters **Retrying** and the full cycle repeats from **Planning** with a fresh plan.
-- Each retry is preceded by a 2-second cooldown.
-- The TUI shows "Attempt N/M" next to the spinner during retry-eligible steps (planning, running, verifying).
-- Retry output includes a visible separator: `═══ RETRY 2/3 ═══ (previous attempt failed at: Verifying, exit code: 1)`.
-- **Documenting** and **Committing** failures are non-fatal and never trigger retries — the command still succeeds.
+- `max_retries` means **total attempts**, not additional retries. `max_retries = 3` means the command gets at most 3 chances (1 initial + 2 fix attempts).
+- When Claude or the verification step fails, the error details (failed step, exit code, stdout, stderr) are captured and fed back to Claude as an auto-fix prompt. Claude analyzes the error and makes targeted fixes, then verification re-runs.
+- Each fix attempt is preceded by a 2-second cooldown.
+- **Documenting** and **Committing** failures are non-fatal and never trigger fix attempts — the command still succeeds.
 - Each command tracks its own attempt count against its `max_retries` limit.
 - Per-command `max_retries` in the TOML config overrides the global value.
 - The CLI `--max-retries` flag sets the global default.
