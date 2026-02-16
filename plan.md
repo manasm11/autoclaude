@@ -1,321 +1,183 @@
-# Implementation Plan: Failure Report Output
+# Plan: Fix Session Resume to Properly Handle Retry History
 
-## Overview
+## Problem Summary
 
-Add failure report file logging and an enhanced TUI failure panel when commands permanently fail (exhaust retries). Three areas of change: runner (file writing + enriched error message), TUI (failure panel with expandable attempt detail), and project metadata (.gitignore, README).
-
----
-
-## 1. `internal/runner/runner.go` — Write failure report to file and enrich error message
-
-### 1a. Add `"os"` and `"path/filepath"` imports
-
-Add to the import block (lines 3–17). Both are needed for file operations.
-
-### 1b. Add `writeFailureReport` helper method
-
-New private method on `*Runner`:
-
-```go
-func (r *Runner) writeFailureReport(cmd *types.Command) string
-```
-
-**Behavior:**
-1. Build a header block:
-   ```
-   ════════════════════════════════════════
-   FAILURE REPORT — 2026-02-16T14:30:05Z
-   Command: "first 100 chars of prompt..."
-   ════════════════════════════════════════
-   ```
-   - Timestamp: `time.Now().Format(time.RFC3339)`
-   - Prompt: truncated to 100 characters — if longer, append `"..."`
-2. Call `cmd.FormatFailureReport()` to get the body
-3. Combine: `header + "\n" + body + "\n\n"` into `fullReport`
-4. Open file `filepath.Join(r.WorkDir, "autoclaude-error.log")` with `os.OpenFile(..., os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)`
-5. Write `fullReport` to the file, close it
-6. If file write fails: append a warning line to `cmd.Output` (e.g. `"[warn] failed to write error log: <err>"`). Do NOT alter the failure flow. Same pattern as `captureGitContext` and `saveSession`.
-7. Return `fullReport` (caller uses it for the TUI error message)
-
-### 1c. Enrich `ExecutionErrorMsg` with failure report data
-
-Modify `ExecutionErrorMsg` struct (lines 31–34) to add a `FailureReport` field:
-
-```go
-type ExecutionErrorMsg struct {
-    CmdIndex      int
-    Err           error
-    FailureReport string  // NEW: full formatted failure report
-}
-```
-
-### 1d. Call `writeFailureReport` and send enriched error at permanent failure points
-
-There are **four** places where `executeSingle` sets `StatusFailed` and returns false:
-
-1. **Planning failure, retries exhausted** (~line 228): `cmd.Status = types.StatusFailed` then `return false`
-2. **Running failure, retries exhausted** (~line 260): same pattern
-3. **Verifying failure, retries exhausted** (~line 291): same pattern
-4. **Post-loop `!success` guard** (~line 304): safety net, same pattern
-
-At each of these four points, **after** `r.sendUpdate(...)` and `r.saveSession()` but **before** `return false`, insert:
-
-```go
-report := r.writeFailureReport(cmd)
-if r.program != nil {
-    r.program.Send(ExecutionErrorMsg{
-        CmdIndex:      i,
-        Err:           fmt.Errorf("command failed after %d attempt(s)", cmd.Attempts),
-        FailureReport: report,
-    })
-}
-```
-
-Only one of these four paths executes per call, so no duplication risk.
+When resuming a session, `internal/tui/model.go:280` unconditionally sets `cmds[m.resumeIndex].Attempts = 0`, giving the command a full fresh retry budget. If a command used 2/3 attempts before interruption, it gets 3 more on resume instead of 1. The `AttemptLogs` are already serialized/deserialized correctly, but the `Attempts` counter is reset.
 
 ---
 
-## 2. `internal/tui/model.go` — Failure panel with expandable attempt details
+## File Changes
 
-### 2a. Add new fields to `Model` struct (lines 108–132)
+### 1. `internal/session/session.go` — Verify AttemptLogs serialization (NO CHANGES NEEDED)
+
+**Finding**: AttemptLogs are already fully serialized and deserialized:
+- `SessionCommand` (line 176) has `AttemptLogs []SessionAttemptLog` with `json:"attempt_logs,omitempty"` tag
+- `Command.ToSessionCommand()` (line 180) converts all `AttemptLog` entries to `SessionAttemptLog`
+- `FromSessionCommand()` (line 211) reconstructs all `AttemptLog` entries from `SessionAttemptLog`
+- `SessionState` (line 22) stores `[]types.SessionCommand` which includes the attempt logs
+- `Attempts int` is also serialized via `json:"attempts"` tag (line 173)
+
+**No changes required in this file.** The serialization is already correct.
+
+---
+
+### 2. `internal/tui/model.go` — Fix resume to preserve attempt count + show history
+
+#### 2a. Add `resetAttempts` field to `Model` struct (after line 135)
+
+Add a new boolean field:
 
 ```go
-failureReport    string  // Full failure report text from runner
-failedCmdIndex   int     // Index of the failed command (-1 if none)
-showExpandedLog  bool    // 'l' toggle: show all attempts' full stdout/stderr
-failureScrollOff int     // Scroll offset for failure panel viewport
+resetAttempts    bool   // --reset-attempts: give resumed commands a fresh retry budget
 ```
 
-Initialize `failedCmdIndex` to `-1` in `NewModel()` (line 135).
+#### 2b. Add `SetResetAttempts` method (after `SetAutoResume`, after line 208)
 
-### 2b. Handle enriched `ExecutionErrorMsg` in `Update()` (lines 379–381)
-
-Currently:
 ```go
-case runner.ExecutionErrorMsg:
-    m.err = msg.Err
-    return m, nil
+func (m *Model) SetResetAttempts() {
+    m.resetAttempts = true
+}
 ```
 
-Change to:
+#### 2c. Fix `resumeRunMsg` handler (lines 277-281)
+
+**Current code:**
 ```go
-case runner.ExecutionErrorMsg:
-    m.err = msg.Err
-    m.failureReport = msg.FailureReport
-    m.failedCmdIndex = msg.CmdIndex
-    m.failureScrollOff = 0
-    m.showExpandedLog = false
-    return m, nil
+// Reset the resume-from command to pending with fresh retry budget
+if m.resumeIndex < len(cmds) {
+    cmds[m.resumeIndex].Status = types.StatusPending
+    cmds[m.resumeIndex].Attempts = 0
+}
 ```
 
-### 2c. Add `'l'` keybinding in `handleRunningKey()` (lines 571–597)
-
-Add a new case in the switch at line 574:
-
+**Replace with:**
 ```go
-case "l":
-    if m.done && m.failedCmdIndex >= 0 {
-        m.showExpandedLog = !m.showExpandedLog
-        m.failureScrollOff = 0  // reset scroll on toggle
-    }
-    return m, nil
-```
-
-### 2d. Modify up/down/j/k scroll in `handleRunningKey()` for done+failure state
-
-Currently (lines 583–593) up/down always scroll `m.scrollOffset`. When `m.done && m.failedCmdIndex >= 0`, they should scroll `m.failureScrollOff` instead (the failure panel viewport).
-
-Change the existing cases:
-
-```go
-case "up", "k":
-    if m.done && m.failedCmdIndex >= 0 {
-        if m.failureScrollOff > 0 {
-            m.failureScrollOff--
-        }
+if m.resumeIndex < len(cmds) {
+    cmds[m.resumeIndex].Status = types.StatusPending
+    if m.resetAttempts {
+        cmds[m.resumeIndex].Attempts = 0
+        cmds[m.resumeIndex].AttemptLogs = nil
     } else {
-        if m.scrollOffset > 0 {
-            m.scrollOffset--
-        }
+        cmds[m.resumeIndex].Attempts = len(cmds[m.resumeIndex].AttemptLogs)
     }
-    return m, nil
-case "down", "j":
-    if m.done && m.failedCmdIndex >= 0 {
-        // Cap will happen during rendering
-        m.failureScrollOff++
-    } else {
-        max := m.maxScrollOffset()
-        if m.scrollOffset < max {
-            m.scrollOffset++
-        }
-    }
-    return m, nil
-```
-
-### 2e. Add `failureViewportHeight()` helper
-
-New method:
-
-```go
-func (m Model) failureViewportHeight() int
-```
-
-Calculate available height for the scrollable portion of the failure panel:
-- Total terminal height minus: title (2 lines) + summary header (4 lines) + command list (`len(m.commands)` lines) + failure panel chrome (~8 lines: section header, info fields, separator, footer note, blank lines) + help bar (2 lines)
-- Minimum 3 lines
-- Used to cap `m.failureScrollOff` and determine visible line count
-
-### 2f. Add `viewFailurePanel()` method
-
-New method:
-
-```go
-func (m Model) viewFailurePanel() string
-```
-
-**Compact view** (default, `showExpandedLog == false`):
-
-```
-═══ FAILURE DETAILS ═══
-
-  Command #3:  "Add error handling to the API endpoi..."
-  Attempts:    3 / 3
-  Last failed: Verifying
-  Exit code:   1
-
-─── Last attempt stderr ───
-<scrollable viewport of last attempt's Stderr>
-
-Full report written to autoclaude-error.log
-```
-
-Populated from:
-- `cmd := m.commands[m.failedCmdIndex]`
-- `lastAttempt := cmd.AttemptLogs[len(cmd.AttemptLogs)-1]`
-- Command number: `m.failedCmdIndex + 1` (1-based display)
-- Prompt: `truncate(cmd.Prompt, 80)` (existing helper)
-- Attempts: `cmd.Attempts` / `cmd.MaxRetries`
-- Last failed step: `lastAttempt.FailedStep`
-- Exit code: `lastAttempt.ExitCode`
-- Stderr content: split `lastAttempt.Stderr` into lines, render scrollable viewport using `m.failureScrollOff` and `m.failureViewportHeight()`
-
-**Expanded view** (`showExpandedLog == true`):
-
-Replace the "Last attempt stderr" section with the full `m.failureReport` (header + all attempts with stdout/stderr). Split into lines, render scrollable using same `m.failureScrollOff` / `m.failureViewportHeight()`.
-
-Keep the same info block and footer.
-
-**Edge cases:**
-- If `cmd.AttemptLogs` is empty: show "No attempt data available" instead of indexing into empty slice
-- If `lastAttempt.Stderr` is empty: show `(no stderr captured)`
-- Cap `m.failureScrollOff` to `max(0, totalLines - viewportHeight)` during rendering (prevents over-scroll)
-- Style the section headers with the existing `statusFailed` lipgloss style (red)
-
-### 2g. Integrate `viewFailurePanel()` into `viewRunningDone()` (lines 1009–1056)
-
-After the per-command results loop (line 1045), before the existing error display (line 1048), insert:
-
-```go
-if m.failedCmdIndex >= 0 {
-    b.WriteString("\n")
-    b.WriteString(m.viewFailurePanel())
 }
 ```
 
-Remove or conditionalize the existing `m.err` display (lines 1048–1050) since the failure panel now shows richer information. If `m.failedCmdIndex >= 0`, the panel handles error display. Otherwise, keep the `m.err` fallback for unexpected errors.
+**Rationale:**
+- Default path: `Attempts = len(AttemptLogs)`. The runner loop at `runner.go:178` does `for cmd.Attempts < cmd.MaxRetries { cmd.Attempts++; ... }`. So if AttemptLogs has 2 entries and MaxRetries is 3, Attempts starts at 2, loop increments to 3 and runs once — giving exactly 1 remaining attempt.
+- `--reset-attempts` path: Clear both `Attempts` AND `AttemptLogs` for consistency. Without clearing AttemptLogs, old entries would remain but the counter restarts, leading to confusing numbering (e.g., "Attempt 1/3" in the runner but AttemptLogs already has 2 entries).
 
-### 2h. Update help bar in `viewRunningDone()` (line 1053)
+#### 2d. Update `viewResume()` to show attempt history (lines 886-887 area)
 
-Change from:
+**Current code** (lines 884-887):
 ```go
-b.WriteString(helpStyle.Render("q: quit"))
+prompt := truncate(sc.Prompt, 70)
+idx := indexStyle.Render(fmt.Sprintf("%d.", i+1))
+
+content := fmt.Sprintf("%s %s  %s %s", idx, prompt, icon, label)
 ```
 
-To:
+**Replace the `content` line with:**
 ```go
-if m.failedCmdIndex >= 0 {
-    b.WriteString(helpStyle.Render("l: toggle full log  |  up/down: scroll  |  q: quit"))
-} else {
-    b.WriteString(helpStyle.Render("q: quit"))
+content := fmt.Sprintf("%s %s  %s %s", idx, prompt, icon, label)
+
+// Show attempt history for commands that used retries
+if sc.Attempts > 0 && status != types.StatusSuccess {
+    attemptInfo := helpStyle.Render(fmt.Sprintf("(%d/%d attempts used)", sc.Attempts, sc.MaxRetries))
+    content += " " + attemptInfo
+}
+```
+
+**Note:** `sc` is `types.SessionCommand` which has both `Attempts int` and `MaxRetries int` — both available directly. `status` is already computed on line 881: `status := types.ParseCommandStatus(sc.Status)`. This will display e.g. `"Command 3: Failed (2/3 attempts used)"` with the attempt info rendered in the gray `helpStyle`.
+
+---
+
+### 3. `main.go` — Add `--reset-attempts` flag
+
+#### 3a. Add flag variable (inside the `var` block, line 98 area)
+
+Add after `clearSession bool`:
+```go
+resetAttempts bool
+```
+
+#### 3b. Register long flag (after line 110 `--clear-session` registration)
+
+```go
+flag.BoolVar(&resetAttempts, "reset-attempts", false, "on resume, reset attempt counters for a full fresh retry budget")
+```
+
+No short alias needed — this is a rarely-used flag like `--clear-session` and `--no-docs`.
+
+#### 3c. Update `usage()` function (line 52 area)
+
+Add a new line after the `--clear-session` line:
+```
+      --reset-attempts  On resume, reset attempt counters for a full fresh retry budget
+```
+
+#### 3d. Pass flag to TUI model (inside `if resumeSession != nil` block, around line 308)
+
+Add right before the closing `}` of the `if resumeSession != nil` block so it applies to both interactive and auto-resume paths:
+
+```go
+if resetAttempts {
+    model.SetResetAttempts()
 }
 ```
 
 ---
 
-## 3. `.gitignore` — Add error log entry
+### 4. `README.md` — Document `--reset-attempts`
 
-After the session state entry (line 34), add:
+#### 4a. Flag reference table (line 162 area)
 
-```
-# Error logs
-autoclaude-error.log
-```
-
----
-
-## 4. `README.md` — Document failure logging and new keybinding
-
-### 4a. Add "Failure logging" section
-
-Insert a new section **before** the "Keybindings" section (before line 323 `## Keybindings`):
+Add a new row after the `--clear-session` row:
 
 ```markdown
-## Failure logging
-
-When a command permanently fails (all retry attempts exhausted), autoclaude writes a detailed failure report to `autoclaude-error.log` in the working directory. The file is append-only — each failure adds a timestamped entry, so logs accumulate across runs.
-
-Each entry includes:
-- Timestamp and command prompt
-- Per-attempt details: failed step, exit code, duration, stdout/stderr
-- Git context (branch, status) at the time of each attempt
-
-The log file is included in `.gitignore` by default.
-
-When execution finishes with failures, the TUI shows a failure panel with:
-- Command number, prompt, attempt count, last failed step, and exit code
-- Scrollable last-attempt stderr
-- Press `l` to expand the full failure report showing all attempts with stdout/stderr
-
-This file is useful for debugging failures in `--auto-run` mode where the TUI is non-interactive.
+| | `--reset-attempts` | bool | `false` | On resume, reset attempt counters for a full fresh retry budget |
 ```
 
-### 4b. Update Running view keybindings table (lines 361–368)
+#### 4b. Session resume section — new subsection (before "### Session file location", line 280)
 
-Add the `l` keybinding row to the Running view table:
+Insert a new subsection after "### Edge cases":
 
 ```markdown
-### Running view
+### Resetting attempt counters
 
-| Key | Action |
-|-----|--------|
-| `j` / `Down` | Scroll output down |
-| `k` / `Up` | Scroll output up |
-| `l` | Toggle expanded failure log (after execution) |
-| `q` | Quit (after execution completes) |
-| `Ctrl+C` | Force quit |
+By default, resuming a session preserves the retry history. If a command used 2 of 3 attempts before interruption, it only gets 1 more attempt on resume.
+
+Use `--reset-attempts` to give resumed commands a full fresh retry budget:
+
+\```sh
+autoclaude --reset-attempts
+autoclaude -f commands.toml --auto-run --reset-attempts
+\```
+
+This is useful after manually fixing an issue that caused repeated failures — the command gets a clean slate without discarding the session's other progress (completed commands are preserved).
+
+When `--reset-attempts` is used, the previous attempt logs are also cleared so that attempt numbering starts fresh.
 ```
 
 ---
 
-## 5. Edge Cases and Considerations
+## Edge Cases
 
-1. **File write permission errors**: `writeFailureReport` handles `os.OpenFile` errors gracefully — appends a warning to `cmd.Output` but doesn't alter the failure flow or panic.
+1. **`Attempts` field already in session JSON**: `SessionCommand` already has `"attempts"` in its JSON tag (types.go:173). `FromSessionCommand` already restores it (types.go:236). The bug is purely in the TUI resume handler overwriting the restored value.
 
-2. **Empty AttemptLogs**: Defensive check in `viewFailurePanel()` — if `cmd.AttemptLogs` has length 0, show "No attempt data available" instead of panicking on slice access.
+2. **AttemptLogs length vs Attempts mismatch**: In theory these should always match at session-save time since `finalizeAttempt` in `runner.go` appends to AttemptLogs and the loop increments Attempts in lockstep. Using `len(AttemptLogs)` is the more reliable source of truth since it's based on actual recorded data rather than a counter.
 
-3. **Very long stderr / report**: The scrollable viewport in the failure panel handles arbitrary length. Scroll offset is capped during rendering.
+3. **Successful commands on resume**: The resume handler only modifies `cmds[m.resumeIndex]`. Commands before resumeIndex already have StatusSuccess and are untouched. Commands after resumeIndex are StatusPending with Attempts=0 — no adjustment needed.
 
-4. **Multiple failed commands**: Currently execution halts on first permanent failure (`executeAll` returns when `executeSingle` returns false). So there will only ever be one `failedCmdIndex`. If this changes in the future, the field stores the most recently failed command.
+4. **`--reset-attempts` without a session**: No-op. `resumeSession` is nil, the `if resumeSession != nil` block containing `if resetAttempts` never executes.
 
-5. **Concurrent file access**: Not an issue — only one runner writes to the log file, and it opens/writes/closes synchronously.
+5. **`--reset-attempts` with `--no-resume`**: `--no-resume` clears the session before resume detection. `resumeSession` stays nil. The flag has no effect. Expected behavior, no special handling needed.
 
-6. **Auto-run mode**: The failure report file is especially useful here since the TUI is non-interactive. The file persists after exit.
+6. **Per-command MaxRetries**: Each command's `MaxRetries` is preserved in the session via `SessionCommand.MaxRetries`. The TUI display uses `sc.MaxRetries` (session command field), not the global `sess.MaxRetries`. This is correct.
 
-7. **`failureScrollOff` vs `scrollOffset`**: Separate fields. During live execution, up/down scrolls `scrollOffset` (output viewport). In done state with failure, up/down scrolls `failureScrollOff` (failure panel). No confusion.
+7. **Clearing AttemptLogs on reset**: Setting `AttemptLogs = nil` ensures `FormatFailureReport()` and retry separator messages (which reference `cmd.Attempts`) are consistent. Without clearing, you'd have ghost attempt entries from before the reset.
 
-8. **Toggle reset**: When pressing `l` to toggle between compact/expanded view, `failureScrollOff` resets to 0 so the user starts at the top of whichever view they switched to.
-
-9. **No-failure case**: When all commands succeed, `failedCmdIndex` stays at `-1`. The failure panel is never rendered. The help bar shows just "q: quit". No behavioral change for the happy path.
+8. **Runner loop compatibility**: The runner loop `for cmd.Attempts < cmd.MaxRetries { cmd.Attempts++ }` works correctly with any starting value of `Attempts`. If Attempts=2 and MaxRetries=3, it runs once (incrementing to 3). If Attempts=0 (reset), it runs 3 times. No runner changes needed.
 
 ---
 
@@ -323,9 +185,8 @@ Add the `l` keybinding row to the Running view table:
 
 | File | Change Summary |
 |------|----------------|
-| `internal/runner/runner.go` | Add `os`, `path/filepath` imports; add `writeFailureReport()` method; add `FailureReport` field to `ExecutionErrorMsg`; send enriched error message at all 4 permanent-failure return points |
-| `internal/tui/model.go` | Add `failureReport`, `failedCmdIndex`, `showExpandedLog`, `failureScrollOff` fields to `Model`; handle enriched `ExecutionErrorMsg`; add `l` keybinding; modify up/down to scroll failure panel when done; add `viewFailurePanel()` and `failureViewportHeight()` methods; integrate panel into `viewRunningDone()`; update help bar |
-| `.gitignore` | Add `autoclaude-error.log` entry |
-| `README.md` | Add "Failure logging" section before Keybindings; add `l` keybinding to Running view table |
+| `internal/tui/model.go` | Add `resetAttempts` field; add `SetResetAttempts()` method; fix `resumeRunMsg` handler to use `len(AttemptLogs)` instead of hardcoded 0; add attempt history display in `viewResume()` |
+| `main.go` | Add `resetAttempts` flag variable, registration, usage text, and pass-through to TUI model |
+| `README.md` | Add `--reset-attempts` row in flag reference table; add "Resetting attempt counters" subsection in Session resume section |
 
-**No new files created.**
+**No new files created. No changes to `internal/session/session.go` or `internal/types/types.go`.**

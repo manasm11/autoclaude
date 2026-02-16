@@ -158,6 +158,7 @@ autoclaude -c "Fix the bug::go test ./..." --auto-run
 | `-w` | `--work-dir` | string | current dir | Working directory for execution |
 | `-a` | `--auto-run` | bool | `false` | Skip TUI review, start immediately |
 | `-R` | `--no-resume` | bool | `false` | Skip session detection and start fresh |
+| | `--reset-attempts` | bool | `false` | Reset attempt counters on resume (gives full retry budget) |
 | | `--no-docs` | bool | `false` | Skip automatic documentation update step |
 | | `--clear-session` | bool | `false` | Delete any existing session file and exit |
 | `-h` | `--help` | bool | `false` | Show help message |
@@ -276,6 +277,19 @@ Resuming previous session from command 3/5
 - **Corrupted file**: If the session file contains invalid JSON, autoclaude prints a warning ("Session file corrupted, starting fresh"), deletes it, and proceeds normally.
 - **Directory mismatch**: If the session was saved in a different working directory, autoclaude warns you and asks for confirmation before resuming.
 - **All commands already succeeded**: If a session file exists but every command has status "Success" (e.g. the cleanup step after completion failed), autoclaude silently clears it and proceeds normally.
+
+### Resetting attempt counters
+
+When resuming a session, autoclaude preserves the retry history from the previous run. If a command used 2 of its 3 attempts before the session was interrupted, it will only get 1 more attempt on resume. The resume screen shows this: `(2/3 attempts used)`.
+
+If you've manually fixed an issue and want to give the command a full fresh retry budget, use `--reset-attempts`:
+
+```sh
+autoclaude --reset-attempts
+autoclaude --reset-attempts --auto-run
+```
+
+This clears the attempt logs and resets the counter to 0, so the command gets all `max_retries` attempts again.
 
 ### Session file location
 

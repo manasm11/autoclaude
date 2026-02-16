@@ -56,6 +56,13 @@ go test ./...
 - **`ExecutionErrorMsg`** carries `FailureReport string` alongside `CmdIndex` and `Err`. Sent at all four permanent-failure return points in `executeSingle` (planning exhausted, running exhausted, verifying exhausted, post-loop safety net).
 - The TUI stores `failureReport`, `failedCmdIndex`, `showExpandedLog`, and `failureScrollOff` on `Model`. The failure panel (`viewFailurePanel()`) shows command info + scrollable last-attempt stderr (compact) or full report (expanded via `l` key). Scroll is separate from the main output scroll (`failureScrollOff` vs `scrollOffset`).
 
+### Session resume and retry budget (internal/tui/model.go)
+
+- **Retry budget preservation on resume**: When resuming a session, the `resumeRunMsg` handler sets `Attempts = len(AttemptLogs)` for the resume-from command. This ensures the retry budget accounts for previous attempts — if a command used 2/3 attempts before interruption, it only gets 1 more on resume.
+- **`--reset-attempts` flag**: `Model.resetAttempts` (set via `SetResetAttempts()`). When true, the resume handler clears both `Attempts` and `AttemptLogs` to give a full fresh retry budget. Both must be cleared together for consistency — old AttemptLogs entries would conflict with restarted attempt numbering.
+- **Resume view attempt history**: `viewResume()` shows `(N/M attempts used)` in `helpStyle` for non-success commands that have attempt logs.
+- **Flag wiring** (`main.go`): `--reset-attempts` is a `flag.BoolVar`, passed to the TUI via `model.SetResetAttempts()` inside the `if resumeSession != nil` block. No-op if no session exists.
+
 ### Execution flow
 
 Each command goes through: Pending -> Planning -> Running -> Verifying -> Documenting -> Committing -> Success. On failure, it retries from Planning with a fresh plan up to `max_retries` times (where `max_retries` is the total attempt count, not additional retries).

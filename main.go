@@ -48,6 +48,7 @@ Flags:
   -w, --work-dir string   Working directory (default: current directory)
   -a, --auto-run          Skip TUI queue review and start execution immediately
   -R, --no-resume         Skip session detection and start fresh (clears any existing session)
+      --reset-attempts    Reset attempt counters on resume (gives full retry budget)
       --no-docs           Skip automatic documentation update step
       --clear-session     Delete any existing session file and exit
   -h, --help              Show this help message
@@ -92,11 +93,12 @@ func main() {
 		cmds         stringSlice
 		maxRetries   int
 		workDir      string
-		autoRun      bool
-		noResume     bool
-		noDocs       bool
-		clearSession bool
-		showHelp     bool
+		autoRun       bool
+		noResume      bool
+		resetAttempts bool
+		noDocs        bool
+		clearSession  bool
+		showHelp      bool
 	)
 
 	// Long flags
@@ -106,6 +108,7 @@ func main() {
 	flag.StringVar(&workDir, "work-dir", "", "working directory for command execution (defaults to current directory)")
 	flag.BoolVar(&autoRun, "auto-run", false, "skip TUI queue review and start execution immediately")
 	flag.BoolVar(&noResume, "no-resume", false, "skip session detection and start fresh")
+	flag.BoolVar(&resetAttempts, "reset-attempts", false, "reset attempt counters on resume (gives full retry budget)")
 	flag.BoolVar(&noDocs, "no-docs", false, "skip automatic documentation update step")
 	flag.BoolVar(&clearSession, "clear-session", false, "delete any existing session file and exit")
 	flag.BoolVar(&showHelp, "help", false, "show usage with examples")
@@ -291,6 +294,9 @@ func main() {
 
 	// If a previous session was detected, configure resume
 	if resumeSession != nil {
+		if resetAttempts {
+			model.SetResetAttempts()
+		}
 		if autoRun {
 			// Auto-resume: skip TUI prompt, log to stdout, and start from where we left off
 			resumeIndex := len(resumeSession.Commands)

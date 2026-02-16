@@ -129,6 +129,7 @@ type Model struct {
 	resumeSession  *session.SessionState // detected previous session (nil if none)
 	resumeIndex    int                   // index where execution would resume from
 	autoResume     bool                  // auto-resume without TUI prompt (--auto-run)
+	resetAttempts  bool                  // --reset-attempts: reset retry budget on resume
 	failureReport    string // Full failure report text from runner
 	failedCmdIndex   int    // Index of the failed command (-1 if none)
 	showExpandedLog  bool   // 'l' toggle: show all attempts' full stdout/stderr
@@ -207,6 +208,11 @@ func (m *Model) SetAutoResume(sess *session.SessionState, resumeIndex int) {
 	m.autoResume = true
 }
 
+// SetResetAttempts configures the model to reset attempt counters on resume, giving a full fresh retry budget.
+func (m *Model) SetResetAttempts() {
+	m.resetAttempts = true
+}
+
 // Init returns the initial command for the BubbleTea program.
 func (m Model) Init() tea.Cmd {
 	if m.resumeSession != nil {
@@ -274,10 +280,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		sess := m.resumeSession
 		cmds := session.ToCommands(sess)
 
-		// Reset the resume-from command to pending with fresh retry budget
+		// Reset the resume-from command to pending, preserving retry budget
 		if m.resumeIndex < len(cmds) {
 			cmds[m.resumeIndex].Status = types.StatusPending
-			cmds[m.resumeIndex].Attempts = 0
+			if m.resetAttempts {
+				cmds[m.resumeIndex].Attempts = 0
+				cmds[m.resumeIndex].AttemptLogs = nil
+			} else {
+				cmds[m.resumeIndex].Attempts = len(cmds[m.resumeIndex].AttemptLogs)
+			}
 		}
 
 		m.commands = cmds
@@ -885,6 +896,11 @@ func (m Model) viewResume() string {
 		idx := indexStyle.Render(fmt.Sprintf("%d.", i+1))
 
 		content := fmt.Sprintf("%s %s  %s %s", idx, prompt, icon, label)
+
+		// Show attempt history for failed/retried commands
+		if len(sc.AttemptLogs) > 0 && status != types.StatusSuccess {
+			content += helpStyle.Render(fmt.Sprintf("  (%d/%d attempts used)", len(sc.AttemptLogs), sc.MaxRetries))
+		}
 
 		if i == m.resumeIndex {
 			content = resumeMarker.Render(">> ") + content
